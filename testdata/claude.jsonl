@@ -1,0 +1,3 @@
+{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174010","cwd":"/example","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"Fix the test"}}
+{"type":"assistant","sessionId":"123e4567-e89b-12d3-a456-426614174010","message":{"role":"assistant","content":[{"type":"text","text":"Checking"},{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"go test"}}]}}
+{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174010","cwd":"/example","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"passed"}]}}

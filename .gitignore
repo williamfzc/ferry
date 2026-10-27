@@ -1,0 +1,11 @@
+# Local tool artifacts
+/pi-session-out.html
+/.qoder/
+
+# Go build and test outputs
+/ferry
+*.test
+*.out
+
+# Local machine files
+.DS_Store

@@ -1,0 +1,143 @@
+{
+  "info": {
+    "id": "ses_example00000000000000000",
+    "slug": "example",
+    "title": "Example session",
+    "version": "1.18.32",
+    "directory": "/example/project",
+    "time": {
+      "created": 1770000000000,
+      "updated": 1770000060000
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "msg_example0000000000000000a",
+        "sessionID": "ses_example00000000000000000",
+        "role": "user",
+        "agent": "build",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "example-model"
+        },
+        "time": {
+          "created": 1770000000000
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_example00000000000000001",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000a",
+          "type": "text",
+          "text": "Fix the test"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_example0000000000000000b",
+        "sessionID": "ses_example00000000000000000",
+        "role": "assistant",
+        "agent": "build",
+        "modelID": "example-model",
+        "providerID": "opencode",
+        "mode": "build",
+        "path": {
+          "cwd": "/example/project",
+          "root": "/example/project"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 10,
+          "output": 5,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "parentID": "msg_example0000000000000000a",
+        "time": {
+          "created": 1770000001000,
+          "completed": 1770000005000
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_example00000000000000002",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000b",
+          "type": "step-start"
+        },
+        {
+          "id": "prt_example00000000000000003",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000b",
+          "type": "reasoning",
+          "text": "considering the failing assertion"
+        },
+        {
+          "id": "prt_example00000000000000004",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000b",
+          "type": "text",
+          "text": "Checking"
+        },
+        {
+          "id": "prt_example00000000000000005",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000b",
+          "type": "tool",
+          "callID": "call-1",
+          "tool": "bash",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "go test ./..."
+            },
+            "output": "passed",
+            "title": "bash",
+            "metadata": {},
+            "time": {
+              "start": 1770000002000,
+              "end": 1770000004000
+            }
+          }
+        },
+        {
+          "id": "prt_example00000000000000006",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000b",
+          "type": "step-finish"
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_example0000000000000000c",
+        "sessionID": "ses_example00000000000000000",
+        "role": "user",
+        "agent": "build",
+        "model": {
+          "providerID": "opencode",
+          "modelID": "example-model"
+        },
+        "parentID": "msg_example0000000000000000b",
+        "time": {
+          "created": 1770000006000
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_example00000000000000007",
+          "sessionID": "ses_example00000000000000000",
+          "messageID": "msg_example0000000000000000c",
+          "type": "text",
+          "text": "thanks"
+        }
+      ]
+    }
+  ]
+}
