@@ -1,6 +1,8 @@
 # Ferry
 
-Ferry is a Go library that preserves coding-agent session files and converts them between Claude Code, Codex, Gemini CLI, OpenCode, Trae CLI, Pi, Qoder CLI, DeepSeek Harness (dsh), Qwen Code, and GitHub Copilot CLI through a common Go representation.
+**Convert AI coding-agent session histories between tools — in Go.**
+
+Ferry is a Go library that preserves coding-agent session files byte-for-byte and converts them between Claude Code, Codex, Gemini CLI, OpenCode, Trae CLI, Pi, Qoder CLI, DeepSeek Harness (dsh), Qwen Code, and GitHub Copilot CLI through a common Go representation. Use it to migrate sessions between CLIs, back up or archive agent histories, and build analytics or tooling on top of them.
 
 [![CI](https://github.com/williamfzc/ferry/actions/workflows/ci.yml/badge.svg)](https://github.com/williamfzc/ferry/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/williamfzc/ferry.svg)](https://pkg.go.dev/github.com/williamfzc/ferry)
