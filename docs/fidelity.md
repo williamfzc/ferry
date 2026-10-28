@@ -17,7 +17,7 @@ Ferry keeps the captured source byte-for-byte, but cross-provider output is a pr
 
 ## Verification levels
 
-Qoder is verified against real local session files (parse, byte-exact restore, conversions). The DeepSeek Harness, Qwen Code, and Copilot CLI formats follow the MIT-licensed [deja-vu](https://github.com/vshulcz/deja-vu) reference parsers and are covered by codec and integration tests, but no native CLI verification exists on this machine; treat their coverage as reference-derived. dsh logs default to zstd framing, which Ferry decodes; raw-line logs restore equally byte-exactly.
+The Qoder codec follows the parent-linked chain layout of earlier Qoder CLI releases and is covered by codec and public integration tests; newer Qoder CLI releases have moved to a different, Claude Code-shaped record layout that Ferry does not parse yet. The DeepSeek Harness, Qwen Code, and Copilot CLI formats follow the MIT-licensed [deja-vu](https://github.com/vshulcz/deja-vu) reference parsers and are covered by codec and integration tests, but no native CLI verification exists on this machine; treat their coverage as reference-derived. dsh logs default to zstd framing, which Ferry decodes; raw-line logs restore equally byte-exactly.
 
 ## Limits
 
