@@ -99,6 +99,25 @@ All providers can be parsed, written, and used as conversion targets. The identi
 | Qwen Code | `qwen` | JSONL chats plus sub-agent logs | `~/.qwen/projects` |
 | Copilot CLI | `copilot` | JSONL event stream | `~/.copilot/session-state` (`COPILOT_HOME`) |
 
+### Support matrix
+
+Every provider implements `Reader` and `Writer`, works as a `Convert` target, and is covered by `Discover`. What differs is how each format was verified:
+
+| Provider | Read | Write | Convert | Discover | Verified against |
+| --- | :-: | :-: | :-: | :-: | --- |
+| Claude Code | ✅ | ✅ | ✅ | ✅ | Native CLI smoke test |
+| Codex CLI | ✅ | ✅ | ✅ | ✅ | Native CLI smoke test + real sessions |
+| Gemini CLI | ✅ | ✅ | ✅ | ✅ | Native CLI smoke test |
+| OpenCode | ✅ | ✅ | ✅ | ✅ | Native CLI smoke test (import/export) |
+| Trae CLI | ✅ | ✅ | ✅ | ✅ | Codec + integration tests |
+| Pi | ✅ | ✅ | ✅ | ✅ | Codec + integration tests |
+| Qoder CLI | ⚠️ | ✅ | ✅ | ⚠️ | Codec + integration tests; current CLI layout not recognized yet |
+| DeepSeek Harness (dsh) | ✅ | ✅ | ✅ | ✅ | deja-vu reference parsers (no native check) |
+| Qwen Code | ✅ | ✅ | ✅ | ✅ | deja-vu reference parsers (no native check) |
+| Copilot CLI | ✅ | ✅ | ✅ | ✅ | deja-vu reference parsers (no native check) |
+
+The one ⚠️ is Qoder: the codec follows the parent-linked chain layout of earlier Qoder CLI releases, while newer Qoder CLI releases write a Claude Code-shaped record layout that does not parse yet — see the [fidelity notes](docs/fidelity.md). Writing a Qoder session produces the earlier layout, so a current Qoder CLI may not read it back either. Cross-provider conversions are projections regardless of the marks: anything a target cannot represent is reported in `Transfer.Limitations`, never dropped silently.
+
 ## Documentation
 
 - API reference: [pkg.go.dev/github.com/williamfzc/ferry/session](https://pkg.go.dev/github.com/williamfzc/ferry/session)
