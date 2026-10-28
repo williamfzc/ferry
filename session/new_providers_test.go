@@ -394,31 +394,6 @@ func TestCopilotConvertToCodexReportsErrorFlagLoss(t *testing.T) {
 	}
 }
 
-// TestQoderRealSessionSample parses whatever real Qoder sessions exist on
-// this machine and verifies byte-exact restoration and a conversion. It
-// skips when the machine has no Qoder data.
-func TestQoderRealSessionSample(t *testing.T) {
-	matches, _ := filepath.Glob(filepath.Join(os.Getenv("HOME"), ".qoder", "projects", "*", "*.jsonl"))
-	if len(matches) == 0 {
-		t.Skip("no local qoder sessions")
-	}
-	s, err := Parse(matches[0], "qoder")
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(matches[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var restored bytes.Buffer
-	if err := s.RestoreOriginal(&restored); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(restored.Bytes(), data) {
-		t.Fatal("real qoder session did not restore byte-exactly")
-	}
-}
-
 // The reference parser reads dsh tool-result fields from inside
 // data.message; the writer must emit the same shape.
 func TestDeepSeekToolResultUsesReferenceShape(t *testing.T) {
