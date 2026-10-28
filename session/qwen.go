@@ -1,8 +1,7 @@
-// This file reads and writes Qwen Code sessions. The format follows the
-// MIT-licensed deja-vu reference parser (internal/sources/qwen.go): Qwen
-// Code is a gemini-cli fork that stores JSONL files under
-// ~/.qwen/projects/<encoded-project>/chats, using Claude-Code-style record
-// envelopes with Gemini-style function call and response parts.
+// This file reads and writes Qwen Code sessions. Qwen Code is a gemini-cli
+// fork that stores JSONL files under ~/.qwen/projects/<encoded-project>/chats,
+// using Claude-Code-style record envelopes with Gemini-style function call
+// and response parts.
 package session
 
 import (
@@ -175,7 +174,7 @@ func readQwen(r io.Reader) (Session, error) {
 	return s, nil
 }
 
-// writeQwen emits the reference Qwen record subset. Tool results travel as
+// writeQwen emits the Qwen record subset. Tool results travel as
 // their own tool_result records carrying a functionResponse part, which
 // requires the tool name from the earlier call.
 func writeQwen(w io.Writer, s Session) error {
@@ -291,9 +290,9 @@ func parseQwenFile(path string) (Session, error) {
 	return s, nil
 }
 
-// isQwenChatFile restricts discovery to the chats directories, mirroring the
-// reference parser: projects/<project>/chats/<id>.jsonl, plus sub-agent logs
-// under projects/<project>/subagents/<session>/agent-<id>.jsonl.
+// isQwenChatFile restricts discovery to the chats directories:
+// projects/<project>/chats/<id>.jsonl, plus sub-agent logs under
+// projects/<project>/subagents/<session>/agent-<id>.jsonl.
 func isQwenChatFile(root, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {

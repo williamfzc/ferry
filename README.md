@@ -112,9 +112,9 @@ Every provider implements `Reader` and `Writer`, works as a `Convert` target, an
 | Trae CLI | ✅ | ✅ | ✅ | ✅ | Codec + integration tests |
 | Pi | ✅ | ✅ | ✅ | ✅ | Codec + integration tests |
 | Qoder CLI | ⚠️ | ✅ | ✅ | ⚠️ | Codec + integration tests; current CLI layout not recognized yet |
-| DeepSeek Harness (dsh) | ✅ | ✅ | ✅ | ✅ | deja-vu reference parsers (no native check) |
-| Qwen Code | ✅ | ✅ | ✅ | ✅ | deja-vu reference parsers (no native check) |
-| Copilot CLI | ✅ | ✅ | ✅ | ✅ | deja-vu reference parsers (no native check) |
+| DeepSeek Harness (dsh) | ✅ | ✅ | ✅ | ✅ | Codec + integration tests (no native CLI check) |
+| Qwen Code | ✅ | ✅ | ✅ | ✅ | Codec + integration tests (no native CLI check) |
+| Copilot CLI | ✅ | ✅ | ✅ | ✅ | Codec + integration tests (no native CLI check) |
 
 The one ⚠️ is Qoder: the codec follows the parent-linked chain layout of earlier Qoder CLI releases, while newer Qoder CLI releases write a Claude Code-shaped record layout that does not parse yet — see the [fidelity notes](docs/fidelity.md). Writing a Qoder session produces the earlier layout, so a current Qoder CLI may not read it back either. Cross-provider conversions are projections regardless of the marks: anything a target cannot represent is reported in `Transfer.Limitations`, never dropped silently.
 
@@ -146,6 +146,10 @@ CI runs the format, vet, and race tests on every push and pull request, and uplo
 ## Contributing
 
 Pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) first — commit messages follow the [Angular convention](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#commit).
+
+## Acknowledgements
+
+Ferry's format handling and session discovery are inspired by [agentsview](https://github.com/kenn-io/agentsview) and [deja-vu](https://github.com/vshulcz/deja-vu). The implementation is independently written.
 
 ## License
 

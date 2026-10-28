@@ -1,8 +1,6 @@
-// This file reads and writes GitHub Copilot CLI sessions. The format follows
-// the MIT-licensed deja-vu reference parser (internal/sources/copilot.go):
-// each session is an append-only events.jsonl under
-// ~/.copilot/session-state/<uuid>, pairing tool.execution_start and
-// tool.execution_complete events by call id.
+// This file reads and writes GitHub Copilot CLI sessions. Each session is an
+// append-only events.jsonl under ~/.copilot/session-state/<uuid>, pairing
+// tool.execution_start and tool.execution_complete events by call id.
 package session
 
 import (
@@ -39,8 +37,8 @@ type copilotEvent struct {
 var copilotSkillContextRe = regexp.MustCompile(`(?s)<skill-context[^>]*>.*?</skill-context>`)
 
 // copilotArguments accepts a JSON object or, for GPT-model apply_patch
-// calls (deja-vu #4491), a freeform patch string that stays a JSON string so
-// the free-text wrapping rules apply downstream.
+// calls, a freeform patch string that stays a JSON string so the free-text
+// wrapping rules apply downstream.
 func copilotArguments(raw json.RawMessage) (json.RawMessage, error) {
 	if len(raw) == 0 || isJSONNull(raw) {
 		return json.RawMessage(`{}`), nil
@@ -106,8 +104,8 @@ func readCopilot(r io.Reader) (Session, error) {
 			}
 			content := data.Content
 			if event.Type == "user.message" {
-				// The reference strips injected skill context from user
-				// messages only; assistant text passes through untouched.
+				// Strip injected skill context from user messages only;
+				// assistant text passes through untouched.
 				content = copilotSkillContextRe.ReplaceAllString(content, "")
 				if strings.TrimSpace(content) == "" {
 					continue
@@ -182,7 +180,7 @@ func readCopilot(r io.Reader) (Session, error) {
 	return s, nil
 }
 
-// writeCopilot emits the reference Copilot event subset. Every conversion
+// writeCopilot emits the Copilot event subset. Every conversion
 // starts from a session.start so the target can identify the session and its
 // workspace.
 func writeCopilot(w io.Writer, s Session) error {

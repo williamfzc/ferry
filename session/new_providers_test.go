@@ -1,6 +1,6 @@
 // These tests cover the Qoder, DeepSeek Harness, Qwen Code, and Copilot CLI
-// providers. Qoder has local real-session coverage; the reference-derived
-// providers are checked against the documented format shapes.
+// providers. Qoder has local real-session coverage; the others are checked
+// against the documented format shapes.
 package session
 
 import (
@@ -394,16 +394,16 @@ func TestCopilotConvertToCodexReportsErrorFlagLoss(t *testing.T) {
 	}
 }
 
-// The reference parser reads dsh tool-result fields from inside
-// data.message; the writer must emit the same shape.
-func TestDeepSeekToolResultUsesReferenceShape(t *testing.T) {
+// dsh tool-result fields live inside data.message; the writer must emit
+// the same shape.
+func TestDeepSeekToolResultMessageShape(t *testing.T) {
 	s := parseProviderTemp(t, "deepseek", deepSeekFixture)
 	var out bytes.Buffer
 	if err := (DeepSeek{}).Write(&out, s); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(out.String(), `"source":{"callId":"c1"}`) || !strings.Contains(out.String(), `"type":"tool/result"`) {
-		t.Fatalf("writer did not emit the reference tool/result shape: %s", out.String())
+		t.Fatalf("writer did not emit the native tool/result shape: %s", out.String())
 	}
 }
 

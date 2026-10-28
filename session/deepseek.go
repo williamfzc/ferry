@@ -1,9 +1,8 @@
-// This file reads and writes DeepSeek Harness (dsh) sessions. The format
-// follows the MIT-licensed deja-vu reference parser (internal/sources/
-// deepseek.go): a session directory holds session.jsonl or a newer
-// session.vN.jsonl generation, optionally zstd-framed. Line one is a session
-// header; the remaining lines are typed events, including streamed
-// text deltas that must be assembled into messages.
+// This file reads and writes DeepSeek Harness (dsh) sessions. A session
+// directory holds session.jsonl or a newer session.vN.jsonl generation,
+// optionally zstd-framed. Line one is a session header; the remaining lines
+// are typed events, including streamed text deltas that must be assembled
+// into messages.
 package session
 
 import (
@@ -216,8 +215,8 @@ func readDeepSeek(r io.Reader) (Session, error) {
 			s.Messages = append(s.Messages, message)
 		case "tool/result":
 			flushPending()
-			// The reference parser reads the call id, error flag, and content
-			// from inside data.message, not from the event data itself.
+			// The call id, error flag, and content live inside data.message,
+			// not on the event data itself.
 			var data struct {
 				Message struct {
 					Source struct {
@@ -319,7 +318,7 @@ func deepSeekContentBlocks(raw json.RawMessage) []ContentBlock {
 }
 
 // deepSeekToolCallBlockType recognizes the assistant-message block forms
-// that duplicate a tool/call event (deja-vu #4291).
+// that duplicate a tool/call event.
 func deepSeekToolCallBlockType(blockType string) bool {
 	switch blockType {
 	case "tool-call", "toolCall", "tool_use", "functionCall":
@@ -454,7 +453,7 @@ func parseDeepSeekFile(path string) (Session, error) {
 	return s, nil
 }
 
-// writeDeepSeek emits the reference dsh subset: one session header line
+// writeDeepSeek emits the dsh subset: one session header line
 // followed by typed events. Streaming deltas are never written; assistant
 // text always travels as a persisted assistant/message event.
 func writeDeepSeek(w io.Writer, s Session) error {
