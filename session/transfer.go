@@ -802,6 +802,9 @@ func skippedRecordLimitations(s Session, target string) []string {
 	if s.SourceType == "copilot" {
 		return skippedCopilotLimitations(s)
 	}
+	if s.SourceType == "doubaowork" {
+		return skippedDoubaoWorkLimitations(s)
+	}
 	counts := make(map[string]int)
 	for _, line := range bytes.Split(s.Original, []byte{'\n'}) {
 		if len(bytes.TrimSpace(line)) == 0 {

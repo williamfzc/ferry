@@ -127,7 +127,7 @@ func contentParts(raw json.RawMessage) []ContentBlock {
 
 func Parse(path, source string) (Session, error) {
 	s := Session{SourceType: source, SourcePath: path}
-	if source != "claude" && source != "codex" && source != "gemini" && source != "opencode" && source != "trae" && source != "pi" && source != "qoder" && source != "deepseek" && source != "qwen" && source != "copilot" {
+	if source != "claude" && source != "codex" && source != "gemini" && source != "opencode" && source != "trae" && source != "pi" && source != "qoder" && source != "deepseek" && source != "qwen" && source != "copilot" && source != "doubaowork" {
 		return s, fmt.Errorf("unsupported source %q", source)
 	}
 	f, err := os.Open(path)
@@ -156,6 +156,8 @@ func Parse(path, source string) (Session, error) {
 		s, err = (Qwen{}).Read(f)
 	case "copilot":
 		s, err = (Copilot{}).Read(f)
+	case "doubaowork":
+		s, err = parseDoubaoWorkFile(f, path)
 	default:
 		s, err = readOriginal(f, source, path)
 	}
