@@ -158,7 +158,7 @@ func Convert(s Session, target string) (Transfer, error) {
 	if derivedID {
 		limitations = append(limitations, fmt.Sprintf("%s requires a UUID native ID; the target ID was derived deterministically from the source ID, and the original snapshot retains the source ID.", providerDisplayName(target)))
 	}
-	if target == "codex" || target == "copilot" {
+	if target == "codex" {
 		if flagged := errorFlaggedResults(s); flagged > 0 {
 			limitations = append(limitations, fmt.Sprintf("Source contains %d tool results flagged as errors; %s has no error flag, so the flag is dropped in the projection.", flagged, providerDisplayName(target)))
 		}
@@ -229,30 +229,6 @@ func formatProjectedPartOrder(parts []projectedPart) string {
 		}
 	}
 	return strings.Join(labels, ", ")
-}
-
-func toolResultOrder(s Session) []string {
-	order := make([]string, 0)
-	for _, message := range s.Messages {
-		for _, part := range message.Parts {
-			if part.Type == "tool_result" && part.ToolResult != nil {
-				order = append(order, part.ToolResult.ID)
-			}
-		}
-	}
-	return order
-}
-
-func sameStringSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // projectedPart is the provider-neutral content that a writer promises to
@@ -394,7 +370,8 @@ func toolCallStatusLimitations(source, target Session, targetType string) []stri
 // equivalent visible to callers. They cannot populate ToolCall.Status, but
 // their source block and Session.Original still retain the exact value.
 func unknownToolCallStatusLimitations(source Session, targetType string) []string {
-	limitations := make([]string, 0)
+	// Aggregated by status value, like toolCallStatusLimitations.
+	counts := make(map[string]int)
 	for _, message := range source.Messages {
 		for _, part := range message.Parts {
 			if part.Type != "tool_call" || part.ToolCall == nil || part.ToolCall.ID == "" || part.ToolCall.Status != "" {
@@ -404,8 +381,17 @@ func unknownToolCallStatusLimitations(source Session, targetType string) []strin
 			if status == "" || acpToolCallStatus(status) != "" {
 				continue
 			}
-			limitations = append(limitations, fmt.Sprintf("Tool call %q source status %q has no ACP equivalent for the %s projection; the original bytes retain it.", part.ToolCall.ID, status, targetType))
+			counts[status]++
 		}
+	}
+	statuses := make([]string, 0, len(counts))
+	for status := range counts {
+		statuses = append(statuses, status)
+	}
+	sort.Strings(statuses)
+	limitations := make([]string, 0, len(statuses))
+	for _, status := range statuses {
+		limitations = append(limitations, fmt.Sprintf("Tool call status %q on %d call(s) has no ACP equivalent for the %s projection; the original bytes retain it.", status, counts[status], targetType))
 	}
 	return limitations
 }
@@ -646,9 +632,6 @@ func projectedParts(s Session) ([]projectedPart, error) {
 	return parts, nil
 }
 
-// pairToolResults moves every tool result to directly follow its matching
-// call. Results whose call never appears keep their relative order at the
-// end.
 // pairToolResults rebuilds the part order as every provider can express it:
 // each tool result sits directly after its call, call-result units follow the
 // call order, and anything else keeps its place. Providers that couple a call
@@ -799,7 +782,7 @@ func skippedRecordLimitations(s Session, target string) []string {
 		return skippedOpenCodeLimitations(s)
 	}
 	if s.SourceType == "claude" {
-		return skippedClaudeLimitations(s, target)
+		return skippedClaudeLimitations(s)
 	}
 	if s.SourceType == "trae" {
 		return skippedTraeLimitations(s, target)
@@ -839,22 +822,11 @@ func skippedRecordLimitations(s Session, target string) []string {
 	if len(counts) == 0 {
 		return skippedCodexSubtypeLimitations(s)
 	}
-	types := make([]string, 0, len(counts))
-	for typeName := range counts {
-		types = append(types, typeName)
-	}
-	// JSONL record order is not semantically relevant here; sorting keeps the
-	// limitation stable for callers and tests.
-	sort.Strings(types)
-	parts := make([]string, 0, len(types))
-	for _, typeName := range types {
-		parts = append(parts, fmt.Sprintf("%s=%d", typeName, counts[typeName]))
-	}
-	limitations := []string{fmt.Sprintf("Source contains unrepresented top-level records (%s); the original bytes retain them.", strings.Join(parts, ", "))}
+	limitations := []string{fmt.Sprintf("Source contains unrepresented top-level records (%s); the original bytes retain them.", formatCounts(counts))}
 	return append(limitations, skippedCodexSubtypeLimitations(s)...)
 }
 
-func skippedClaudeLimitations(s Session, target string) []string {
+func skippedClaudeLimitations(s Session) []string {
 	counts := make(map[string]int)
 	for _, line := range bytes.Split(s.Original, []byte{'\n'}) {
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -992,7 +964,7 @@ func skippedTraeLimitations(s Session, target string) []string {
 			}
 			traeCountUnsupportedContent(value.Item, counts)
 		case "compacted":
-			if target != "codex" && target != "trae" && target != "pi" {
+			if !writesSummaries(target) {
 				counts[record.Type]++
 			}
 		case "turn_context", "world_state", "token_usage_record", "inter_agent_communication":
@@ -1167,7 +1139,7 @@ func skippedPiLimitations(s Session, target string) []string {
 				}
 			}
 		case "compaction", "branch_summary":
-			if target != "codex" && target != "trae" && target != "pi" {
+			if !writesSummaries(target) {
 				counts[entry.Type]++
 			}
 		default:
@@ -1189,25 +1161,54 @@ func skippedPiLimitations(s Session, target string) []string {
 					counts["inactive_branch"]++
 				}
 			}
+			// Pi's resume context drops active-path messages before the
+			// latest compaction's firstKeptEntryId; the summary stands in for
+			// them, but the loss is reported for every target.
+			kept := make(map[string]bool, len(path))
+			for _, entry := range piContextPath(path) {
+				kept[entry.ID] = true
+			}
+			for _, entry := range path {
+				// System messages are already counted as message.role=system.
+				if entry.Type == "message" && !kept[entry.ID] && piMessageRole(entry.Message) != "system" {
+					counts["compacted_away"]++
+				}
+			}
 		}
 	}
 	return formatProviderRecordLimitations("Pi", counts)
+}
+
+// writesSummaries reports whether target's writer natively represents summary
+// messages, so a source compaction record needs no limitation.
+func writesSummaries(target string) bool {
+	switch target {
+	case "codex", "trae", "pi", "copilot":
+		return true
+	}
+	return false
+}
+
+// formatCounts renders counts as "name=count" pairs sorted by name, so
+// limitation messages stay stable for callers and tests.
+func formatCounts(counts map[string]int) string {
+	names := make([]string, 0, len(counts))
+	for name := range counts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
+	}
+	return strings.Join(parts, ", ")
 }
 
 func formatProviderRecordLimitations(provider string, counts map[string]int) []string {
 	if len(counts) == 0 {
 		return nil
 	}
-	types := make([]string, 0, len(counts))
-	for name := range counts {
-		types = append(types, name)
-	}
-	sort.Strings(types)
-	parts := make([]string, 0, len(types))
-	for _, name := range types {
-		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
-	}
-	return []string{fmt.Sprintf("%s source contains unrepresented records (%s); the original bytes retain them.", provider, strings.Join(parts, ", "))}
+	return []string{fmt.Sprintf("%s source contains unrepresented records (%s); the original bytes retain them.", provider, formatCounts(counts))}
 }
 
 // skippedClaudeThinking counts Claude thinking blocks, which carry model
@@ -1343,16 +1344,7 @@ func formatGeminiCounts(label string, counts map[string]int) string {
 	if len(counts) == 0 {
 		return ""
 	}
-	types := make([]string, 0, len(counts))
-	for name := range counts {
-		types = append(types, name)
-	}
-	sort.Strings(types)
-	parts := make([]string, 0, len(types))
-	for _, name := range types {
-		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
-	}
-	return fmt.Sprintf("Gemini source contains %s (%s); the original bytes retain them.", label, strings.Join(parts, ", "))
+	return fmt.Sprintf("Gemini source contains %s (%s); the original bytes retain them.", label, formatCounts(counts))
 }
 
 // structuredResultCount counts tool results whose structured payload is
@@ -1514,16 +1506,7 @@ func skippedCodexSubtypeLimitations(s Session) []string {
 		limitations = append(limitations, text)
 	}
 	if len(roleCounts) > 0 {
-		types := make([]string, 0, len(roleCounts))
-		for role := range roleCounts {
-			types = append(types, role)
-		}
-		sort.Strings(types)
-		parts := make([]string, 0, len(types))
-		for _, role := range types {
-			parts = append(parts, fmt.Sprintf("%s=%d", role, roleCounts[role]))
-		}
-		limitations = append(limitations, fmt.Sprintf("Source contains Codex role messages with no target representation (%s); the original bytes retain them.", strings.Join(parts, ", ")))
+		limitations = append(limitations, fmt.Sprintf("Source contains Codex role messages with no target representation (%s); the original bytes retain them.", formatCounts(roleCounts)))
 	}
 	if replacementHistories > 0 {
 		limitations = append(limitations, fmt.Sprintf("Source contains %d compacted records whose replacement histories are not expanded; the original bytes retain them.", replacementHistories))
@@ -1558,34 +1541,13 @@ func formatSubtypeCounts(recordType string, counts map[string]int) string {
 	if len(counts) == 0 {
 		return ""
 	}
-	types := make([]string, 0, len(counts))
-	for subtype := range counts {
-		types = append(types, subtype)
-	}
-	sort.Strings(types)
-	parts := make([]string, 0, len(types))
-	for _, subtype := range types {
-		parts = append(parts, fmt.Sprintf("%s=%d", subtype, counts[subtype]))
-	}
-	return fmt.Sprintf("Source contains unrepresented Codex %s subtypes (%s); the original bytes retain them.", recordType, strings.Join(parts, ", "))
+	return fmt.Sprintf("Source contains unrepresented Codex %s subtypes (%s); the original bytes retain them.", recordType, formatCounts(counts))
 }
 
 func representedRecord(source, target, recordType string) bool {
-	if source == "claude" {
-		return recordType == "user" || recordType == "assistant" || recordType == "summary"
-	}
+	// Other providers return earlier from skippedRecordLimitations.
 	if source != "codex" {
-		switch source {
-		case "trae":
-			// These records either feed the common dialogue model or carry the
-			// session identity. Provider-specific state and unknown records are
-			// intentionally reported by skippedTraeLimitations.
-			return recordType == "session_meta" || recordType == "history_mutation" || recordType == "response_item" || recordType == "event_msg" || recordType == "compacted"
-		case "pi":
-			return recordType == "session" || recordType == "message" || recordType == "compaction" || recordType == "branch_summary"
-		default:
-			return false
-		}
+		return false
 	}
 	if target == "claude" {
 		return recordType == "response_item" || recordType == "event_msg" || recordType == "compacted"

@@ -215,7 +215,7 @@ func readTrae(data []byte) (Session, error) {
 			}
 		case "response_item":
 			recognized = true
-			if parsed, ok := traeResponse(rec.Payload, rec.Timestamp); ok {
+			if parsed, ok := traeItemMessage(rec.Payload, rec.Timestamp); ok {
 				parsedItems = append(parsedItems, parsed...)
 			}
 		case "event_msg":
@@ -326,24 +326,6 @@ func traeItemMessage(raw json.RawMessage, timestamp string) ([]traeParsed, bool)
 	}
 }
 
-func traeResponse(raw json.RawMessage, timestamp string) ([]traeParsed, bool) {
-	var item struct {
-		Type string `json:"type"`
-		Role string `json:"role"`
-	}
-	if json.Unmarshal(raw, &item) != nil {
-		return nil, false
-	}
-	if item.Type == "message" && item.Role == "user" && traeRuntimeUserMessage(raw) {
-		return nil, false
-	}
-	return traeItemMessage(raw, timestamp)
-}
-
-func traeRuntimeUserMessage(raw json.RawMessage) bool {
-	return traeSyntheticContextMessage(raw)
-}
-
 // traeSyntheticContextMessage recognizes the complete context envelopes that
 // Trae injects as user-role records. A marker inside an ordinary user message
 // is deliberately not enough: quoted markers stay visible in the projection.
@@ -437,7 +419,7 @@ func traeContentParts(raw json.RawMessage) []ContentBlock {
 	}
 	var one map[string]json.RawMessage
 	if json.Unmarshal(raw, &one) == nil && one != nil {
-		return []ContentBlock{traeContentPart(raw)}
+		return compactTraeParts([]ContentBlock{traeContentPart(raw)})
 	}
 	var items []json.RawMessage
 	if json.Unmarshal(raw, &items) != nil {
@@ -518,12 +500,6 @@ func traeReasoningContentKind(kind string) bool {
 	}
 }
 
-// traeToolResultText only joins textual content blocks.  The generic session
-// helper treats any object with a text field as display text, which makes
-// structured output (for example an image block carrying an alt-text field)
-// look like tool output.  Trae's function-call outputs are arrays of typed
-// content items, so retain the source bytes but expose just their text in the
-// common projection.
 // traeStripReasoning removes reasoning items from a structured tool output so
 // the JSON text a target writer serializes matches the filtered common
 // projection instead of leaking private reasoning into every target. An
@@ -609,6 +585,12 @@ func traeRejectIdenticalReplays(s Session) error {
 	return nil
 }
 
+// traeToolResultText only joins textual content blocks.  The generic session
+// helper treats any object with a text field as display text, which makes
+// structured output (for example an image block carrying an alt-text field)
+// look like tool output.  Trae's function-call outputs are arrays of typed
+// content items, so retain the source bytes but expose just their text in the
+// common projection.
 func traeToolResultText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
@@ -635,6 +617,11 @@ func traeToolResultText(raw json.RawMessage) string {
 		return ""
 	}
 	kind := stringValue(fields["type"])
+	// Reasoning items are private; traeStripReasoning drops them from
+	// RawContent, so keep them out of the display text as well.
+	if traeReasoningContentKind(kind) || strings.EqualFold(stringValue(fields["source"]), "reasoning") {
+		return ""
+	}
 	if kind == "text" || kind == "input_text" || kind == "output_text" || kind == "Text" || kind == "" {
 		if value := stringValue(fields["text"]); value != "" {
 			return value

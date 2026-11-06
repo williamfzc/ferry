@@ -561,22 +561,6 @@ func rejectUnexpectedFields(raw map[string]json.RawMessage, allowed ...string) e
 	return nil
 }
 
-// toolInput accepts JSON objects and Codex's JSON-encoded argument string.
-func toolInput(raw json.RawMessage) (json.RawMessage, error) {
-	if len(raw) == 0 {
-		return json.RawMessage(`{}`), nil
-	}
-	var encoded string
-	if json.Unmarshal(raw, &encoded) == nil {
-		raw = json.RawMessage(encoded)
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
-		return nil, fmt.Errorf("tool input must be a JSON object")
-	}
-	return raw, nil
-}
-
 // toolResultText renders a tool result as text. Structured results are
 // serialized as exact JSON text so object-only providers keep every value;
 // Convert reports the serialization.

@@ -1,10 +1,11 @@
 // These tests cover the Qoder, DeepSeek Harness, Qwen Code, and Copilot CLI
-// providers. Qoder has local real-session coverage; the others are checked
-// against the documented format shapes.
+// providers, all checked against hermetic fixtures of the documented format
+// shapes.
 package session
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,10 +75,7 @@ func TestQoderBranchChainFailsClosed(t *testing.T) {
 }
 
 func TestQoderConvertToClaudeKeepsToolError(t *testing.T) {
-	s, err := parseQoderFromTemp(t, qoderFixture)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := parseProviderTemp(t, "qoder", qoderFixture)
 	transfer, err := Convert(s, "claude")
 	if err != nil {
 		t.Fatal(err)
@@ -117,16 +115,8 @@ func parseProviderTemp(t *testing.T, source string, data []byte) Session {
 	return s
 }
 
-func parseQoderFromTemp(t *testing.T, data []byte) (Session, error) {
-	s := parseProviderTemp(t, "qoder", data)
-	return s, nil
-}
-
 func TestQoderParseUsesSidecarWorkspace(t *testing.T) {
-	s, err := parseQoderFromTemp(t, qoderFixture)
-	if err != nil {
-		t.Fatal(err)
-	}
+	s := parseProviderTemp(t, "qoder", qoderFixture)
 	if s.Workspace != "/work" {
 		t.Fatalf("workspace = %q, want /work", s.Workspace)
 	}
@@ -376,7 +366,7 @@ func TestCopilotRoundTrip(t *testing.T) {
 	}
 }
 
-func TestCopilotConvertToCodexReportsErrorFlagLoss(t *testing.T) {
+func TestClaudeToCopilotKeepsErrorFlag(t *testing.T) {
 	original := []byte(`{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"failed","is_error":true}]}}
 {"type":"assistant","sessionId":"123e4567-e89b-12d3-a456-426614174000","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"Bash","input":{"command":"ls"}}]}}
 `)
@@ -388,9 +378,113 @@ func TestCopilotConvertToCodexReportsErrorFlagLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	joined := strings.Join(transfer.Limitations, "\n")
-	if !strings.Contains(joined, "flag is dropped") {
-		t.Fatalf("copilot error flag loss was not reported: %v", transfer.Limitations)
+	if joined := strings.Join(transfer.Limitations, "\n"); strings.Contains(joined, "flag is dropped") {
+		t.Fatalf("copilot carries the error flag, but its loss was reported: %v", transfer.Limitations)
+	}
+	got, err := (Copilot{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copilotHasErrorResult(got, "failed") {
+		t.Fatalf("copilot target lost the error flag: %+v", got.Messages)
+	}
+}
+
+func copilotHasErrorResult(s Session, content string) bool {
+	for _, message := range s.Messages {
+		for _, part := range message.Parts {
+			if part.Type == "tool_result" && part.ToolResult != nil && part.ToolResult.IsError && part.ToolResult.Content == content {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// A failed Copilot call carries success:false and its reason in
+// error.message; both survive the read and a conversion to Claude.
+func TestCopilotFailedToolResultKeepsErrorFlag(t *testing.T) {
+	data := strings.Replace(string(copilotFixture),
+		`"data":{"toolCallId":"c1","result":{"content":"a.txt"}}`,
+		`"data":{"toolCallId":"c1","success":false,"error":{"message":"permission denied"}}`, 1)
+	// Claude has no summary role; drop the compaction record.
+	data = strings.Replace(data, `{"type":"session.compaction_complete","timestamp":"2026-01-01T00:00:05Z","data":{"success":true,"summaryContent":"earlier work summarized"}}`+"\n", "", 1)
+	s := parseProviderTemp(t, "copilot", []byte(data))
+	if !copilotHasErrorResult(s, "permission denied") {
+		t.Fatalf("copilot failure misread: %+v", s.Messages)
+	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := (Claude{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !copilotHasErrorResult(target, "permission denied") {
+		t.Fatalf("claude target lost the copilot error: %+v", target.Messages)
+	}
+}
+
+// Skill context in assistant text is not stripped, so it is not counted,
+// and assistant.message is not an unknown event type.
+func TestCopilotAssistantSkillContextNotCounted(t *testing.T) {
+	data := strings.Replace(string(copilotFixture), `"content":"checking"`, `"content":"<skill-context>x</skill-context>checking"`, 1)
+	data = strings.Replace(data, `<skill-context source=\"x\">SECRET</skill-context>`, "", 1)
+	s := parseProviderTemp(t, "copilot", []byte(data))
+	if limitations := skippedCopilotLimitations(s); len(limitations) != 0 {
+		t.Fatalf("unexpected limitations: %v", limitations)
+	}
+}
+
+// Plugin-injected dsh user messages are skipped by the reader and must be
+// reported.
+func TestDeepSeekInjectedUserMessageIsReported(t *testing.T) {
+	data := append([]byte{}, deepSeekFixture...)
+	data = append(data, []byte(`{"type":"user/message","seq":9,"time":"2026-01-01T00:00:09Z","data":{"source":{"kind":"plugin"},"content":"INJECTED"}}`+"\n")...)
+	s := parseProviderTemp(t, "deepseek", data)
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined := strings.Join(transfer.Limitations, "\n"); !strings.Contains(joined, "1 dsh non-user (plugin-injected) user message") {
+		t.Fatalf("injected user message was not reported: %v", transfer.Limitations)
+	}
+}
+
+// Truncated streamed input of an unfinished Qoder call is kept as free text.
+func TestQoderTruncatedInputStaysMarshalable(t *testing.T) {
+	data := strings.Replace(string(qoderFixture),
+		`"input":"{\"pattern\":\"**/*.sql\"}","finished":true`,
+		`"input":"{\"command\":\"l","finished":false`, 1)
+	s := parseProviderTemp(t, "qoder", []byte(data))
+	if _, err := json.Marshal(s); err != nil {
+		t.Fatalf("session is not marshalable: %v", err)
+	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transfer.Target), `{\"command\":\"l`) {
+		t.Fatalf("truncated input was not carried as text: %s", transfer.Target)
+	}
+}
+
+// Qwen non-text parts are not silently dropped: images become image parts
+// and any other shape fails the conversion closed.
+func TestQwenNonTextPartsAreKept(t *testing.T) {
+	image := strings.Replace(string(qwenFixture), `"parts":[{"text":"read it"}]`, `"parts":[{"text":"read it"},{"inlineData":{"mimeType":"image/png","data":"AAAA"}},{"text":""}]`, 1)
+	s := parseProviderTemp(t, "qwen", []byte(image))
+	if parts := s.Messages[0].Parts; len(parts) != 2 || parts[1].Type != "image" {
+		t.Fatalf("qwen image part misread: %+v", parts)
+	}
+	pdf := strings.Replace(string(qwenFixture), `"parts":[{"text":"read it"}]`, `"parts":[{"text":"read it"},{"inlineData":{"mimeType":"application/pdf","data":"AAAA"}}]`, 1)
+	s = parseProviderTemp(t, "qwen", []byte(pdf))
+	if parts := s.Messages[0].Parts; len(parts) != 2 || parts[1].Type != "unknown" {
+		t.Fatalf("qwen pdf part misread: %+v", parts)
+	}
+	if _, err := Convert(s, "claude"); err == nil {
+		t.Fatal("unknown qwen part was silently dropped by the conversion")
 	}
 }
 

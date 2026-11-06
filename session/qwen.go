@@ -7,21 +7,17 @@ package session
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
 // Qwen reads and writes the Qwen Code JSONL session format.
 type Qwen struct{}
 
-func (Qwen) Read(r io.Reader) (Session, error) { return readQwen(r) }
+func (Qwen) Read(r io.Reader) (Session, error) { return readCaptured(r, readQwen) }
 
 func (Qwen) Write(w io.Writer, s Session) error { return writeQwen(w, s) }
 
@@ -89,15 +85,25 @@ func readQwen(r io.Reader) (Session, error) {
 		var parts []ContentBlock
 		for _, rawPart := range envelope.Parts {
 			var fields struct {
-				Text             string          `json:"text"`
+				Text             *string         `json:"text"`
 				Thought          bool            `json:"thought"`
 				FunctionCall     json.RawMessage `json:"functionCall"`
 				FunctionResponse json.RawMessage `json:"functionResponse"`
+				InlineData       *struct {
+					MIME string `json:"mimeType"`
+				} `json:"inlineData"`
+				FileData *struct {
+					MIME string `json:"mimeType"`
+				} `json:"fileData"`
 			}
 			if err := json.Unmarshal(rawPart, &fields); err != nil {
 				return s, fmt.Errorf("%s:%d: invalid qwen part: %w", s.SourcePath, line, err)
 			}
 			switch {
+			case fields.InlineData != nil && strings.HasPrefix(strings.ToLower(fields.InlineData.MIME), "image/"),
+				fields.FileData != nil && strings.HasPrefix(strings.ToLower(fields.FileData.MIME), "image/"):
+				// Same shape as Gemini image parts.
+				parts = append(parts, ContentBlock{Type: "image", Raw: bytes.Clone(rawPart)})
 			case len(fields.FunctionCall) > 0 && !isJSONNull(fields.FunctionCall):
 				var call struct {
 					ID   string          `json:"id"`
@@ -149,13 +155,17 @@ func readQwen(r io.Reader) (Session, error) {
 					result.RawContent = bytes.Clone(output)
 				}
 				parts = append(parts, ContentBlock{Type: "tool_result", ToolResult: result, Raw: bytes.Clone(rawPart)})
-			case fields.Text != "":
-				if fields.Thought {
-					// Model reasoning: reported by skippedQwenLimitations,
-					// never exposed through the projection.
-					continue
+			case fields.Thought:
+				// Model reasoning: reported by skippedQwenLimitations,
+				// never exposed through the projection.
+			case fields.Text != nil:
+				if *fields.Text != "" {
+					parts = append(parts, ContentBlock{Type: "text", Text: *fields.Text, Raw: bytes.Clone(rawPart)})
 				}
-				parts = append(parts, ContentBlock{Type: "text", Text: fields.Text, Raw: bytes.Clone(rawPart)})
+			default:
+				// Any other part shape (non-image data, executableCode, ...)
+				// is kept so conversion fails closed instead of dropping it.
+				parts = append(parts, ContentBlock{Type: "unknown", Raw: bytes.Clone(rawPart)})
 			}
 		}
 		if len(parts) > 0 {
@@ -268,28 +278,6 @@ func writeQwen(w io.Writer, s Session) error {
 	return err
 }
 
-// parseQwenFile reads one local Qwen Code JSONL file.
-func parseQwenFile(path string) (Session, error) {
-	data, err := os.ReadFile(path)
-	s := Session{SourceType: "qwen", SourcePath: path}
-	if err != nil {
-		return s, err
-	}
-	s, err = readQwen(bytes.NewReader(data))
-	if err != nil {
-		s.SourcePath = path
-		return s, err
-	}
-	s.Original = data
-	s.SourcePath = path
-	if info, statErr := os.Stat(path); statErr == nil {
-		s.Updated = info.ModTime()
-	}
-	sum := sha256.Sum256([]byte("qwen\x00" + path))
-	s.ID = hex.EncodeToString(sum[:16])
-	return s, nil
-}
-
 // isQwenChatFile restricts discovery to the chats directories:
 // projects/<project>/chats/<id>.jsonl, plus sub-agent logs under
 // projects/<project>/subagents/<session>/agent-<id>.jsonl.
@@ -298,19 +286,11 @@ func isQwenChatFile(root, path string) bool {
 	if err != nil {
 		return false
 	}
-	parts := splitPath(rel)
+	parts := strings.Split(rel, string(filepath.Separator))
 	if len(parts) == 3 && parts[1] == "chats" && filepath.Ext(path) == ".jsonl" {
 		return true
 	}
-	return len(parts) == 4 && parts[1] == "subagents" && stringsHasPrefix(parts[2], "") && stringsHasPrefix(filepath.Base(path), "agent-")
-}
-
-func splitPath(rel string) []string {
-	return strings.Split(rel, string(filepath.Separator))
-}
-
-func stringsHasPrefix(s, prefix string) bool {
-	return strings.HasPrefix(s, prefix)
+	return len(parts) == 4 && parts[1] == "subagents" && strings.HasPrefix(parts[3], "agent-") && filepath.Ext(path) == ".jsonl"
 }
 
 // skippedQwenLimitations reports the Qwen content that stays out of the
@@ -379,16 +359,7 @@ func skippedQwenLimitations(s Session) []string {
 		limitations = append(limitations, fmt.Sprintf("Source contains %d Qwen /branch fork marker(s) on copied records; the copied history stays in the projection.", forks))
 	}
 	if len(unknown) > 0 {
-		types := make([]string, 0, len(unknown))
-		for name := range unknown {
-			types = append(types, name)
-		}
-		sort.Strings(types)
-		parts := make([]string, 0, len(types))
-		for _, name := range types {
-			parts = append(parts, fmt.Sprintf("%s=%d", name, unknown[name]))
-		}
-		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented Qwen record types (%s); the original bytes retain them.", strings.Join(parts, ", ")))
+		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented Qwen record types (%s); the original bytes retain them.", formatCounts(unknown)))
 	}
 	return limitations
 }

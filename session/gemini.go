@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -211,11 +212,11 @@ func finishGemini(meta geminiMetadata, records []geminiMessage) (Session, error)
 		}
 	}
 	for i, record := range records {
-		if record.ID == "" {
-			return s, fmt.Errorf("Gemini message %d has no id", i)
-		}
 		if record.Type != "user" && record.Type != "gemini" {
 			continue
+		}
+		if record.ID == "" {
+			return s, fmt.Errorf("Gemini message %d has no id", i)
 		}
 		parts, err := geminiParts(record.Content)
 		if err != nil {
@@ -349,10 +350,8 @@ func geminiParts(raw json.RawMessage) ([]ContentBlock, error) {
 			if err := json.Unmarshal(result.Response, &responseObject); err != nil || responseObject == nil {
 				return nil, fmt.Errorf("functionResponse response must be a JSON object")
 			}
-			if len(result.Response) > 0 {
-				parts = append(parts, ContentBlock{Type: "tool_result", Raw: bytes.Clone(item), ToolResult: &ToolResult{ID: result.ID, Content: geminiRawText(result.Response), RawContent: bytes.Clone(result.Response)}})
-				continue
-			}
+			parts = append(parts, ContentBlock{Type: "tool_result", Raw: bytes.Clone(item), ToolResult: &ToolResult{ID: result.ID, Content: geminiRawText(result.Response), RawContent: bytes.Clone(result.Response)}})
+			continue
 		}
 		if inline, ok := fields["inlineData"]; ok {
 			var data struct {
@@ -550,7 +549,7 @@ func applyGeminiPatch(messages map[string]geminiMessage, order *[]string, raw js
 			}
 		}
 		for _, id := range *order {
-			if !containsString(patch.OrderIDs, id) {
+			if !slices.Contains(patch.OrderIDs, id) {
 				next = append(next, id)
 			}
 		}
@@ -563,15 +562,6 @@ func applyGeminiPatch(messages map[string]geminiMessage, order *[]string, raw js
 		*order = next
 	}
 	return nil
-}
-
-func containsString(items []string, needle string) bool {
-	for _, item := range items {
-		if item == needle {
-			return true
-		}
-	}
-	return false
 }
 
 func (Gemini) Write(w io.Writer, s Session) error {
@@ -728,36 +718,29 @@ func geminiMessageRecord(msg Message, sessionID string, index int, calls map[str
 			if part.ToolResult == nil || part.ToolResult.ID == "" {
 				return nil, fmt.Errorf("part %d: invalid tool result", j)
 			}
-			if msg.Role == "assistant" || geminiFunctionResponseName(part.Raw) == "" {
+			name := geminiFunctionResponseName(part.Raw)
+			if msg.Role == "assistant" || name == "" {
 				if err := geminiAttachResult(calls, part.ToolResult, msg.Timestamp); err != nil {
 					return nil, fmt.Errorf("part %d: %w", j, err)
 				}
 				continue
 			}
-			if msg.Role == "user" {
-				name := geminiFunctionResponseName(part.Raw)
-				if name == "" {
-					return nil, fmt.Errorf("part %d: function response name is required and is not available in the common model", j)
-				}
-				if err := validateGeminiFunctionResponseFields(part.Raw); err != nil {
-					return nil, fmt.Errorf("part %d: %w", j, err)
-				}
-				response, err := geminiFunctionResponseObject(part)
-				if err != nil {
-					return nil, fmt.Errorf("part %d: %w", j, err)
-				}
-				functionResponse := map[string]any{"id": part.ToolResult.ID, "name": name, "response": response}
-				responseParts, hasParts, err := geminiFunctionResponseParts(part.Raw)
-				if err != nil {
-					return nil, fmt.Errorf("part %d: %w", j, err)
-				}
-				if hasParts {
-					functionResponse["parts"] = responseParts
-				}
-				parts = append(parts, map[string]any{"functionResponse": functionResponse})
-				continue
+			if err := validateGeminiFunctionResponseFields(part.Raw); err != nil {
+				return nil, fmt.Errorf("part %d: %w", j, err)
 			}
-			return nil, fmt.Errorf("part %d: tool result cannot be represented inline", j)
+			response, err := geminiFunctionResponseObject(part)
+			if err != nil {
+				return nil, fmt.Errorf("part %d: %w", j, err)
+			}
+			functionResponse := map[string]any{"id": part.ToolResult.ID, "name": name, "response": response}
+			responseParts, hasParts, err := geminiFunctionResponseParts(part.Raw)
+			if err != nil {
+				return nil, fmt.Errorf("part %d: %w", j, err)
+			}
+			if hasParts {
+				functionResponse["parts"] = responseParts
+			}
+			parts = append(parts, map[string]any{"functionResponse": functionResponse})
 		case "image":
 			if geminiHasThoughtSignature(part.Raw) {
 				return nil, fmt.Errorf("part %d: thought signature cannot be represented without loss", j)

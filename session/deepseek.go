@@ -8,8 +8,6 @@ package session
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -26,7 +24,7 @@ import (
 // DeepSeek reads and writes the DeepSeek Harness (dsh) JSONL event format.
 type DeepSeek struct{}
 
-func (DeepSeek) Read(r io.Reader) (Session, error) { return readDeepSeek(r) }
+func (DeepSeek) Read(r io.Reader) (Session, error) { return readCaptured(r, readDeepSeek) }
 
 func (DeepSeek) Write(w io.Writer, s Session) error { return writeDeepSeek(w, s) }
 
@@ -337,12 +335,6 @@ func deepSeekReasoningType(blockType string) bool {
 	}
 }
 
-type deepSeekResult struct {
-	content    string
-	rawContent json.RawMessage
-	isError    bool
-}
-
 // deepSeekResultText joins the text of a dsh tool-result content value and
 // reports block-level error flags.
 func deepSeekResultText(raw json.RawMessage, isError bool) (string, json.RawMessage, bool) {
@@ -417,39 +409,24 @@ func deepSeekArguments(raw json.RawMessage) (json.RawMessage, error) {
 // parseDeepSeekFile reads one local dsh log, transparently decoding the
 // zstd framing dsh writes by default. The captured original stays the exact
 // file bytes so RestoreOriginal reproduces the compressed file.
-func parseDeepSeekFile(path string) (Session, error) {
-	data, err := os.ReadFile(path)
-	s := Session{SourceType: "deepseek", SourcePath: path}
+func parseDeepSeekFile(f io.Reader, path string) (Session, error) {
+	data, err := io.ReadAll(f)
 	if err != nil {
-		return s, err
+		return Session{SourceType: "deepseek"}, err
 	}
-	var stream io.Reader = bytes.NewReader(data)
-	if strings.HasSuffix(path, ".zstd") {
-		decoder, err := zstd.NewReader(bytes.NewReader(data))
-		if err != nil {
-			s.SourcePath = path
-			return s, fmt.Errorf("%s: dsh zstd frame cannot be decoded: %w", path, err)
-		}
-		defer decoder.Close()
-		decompressed, readErr := io.ReadAll(decoder)
-		if readErr != nil {
-			s.SourcePath = path
-			return s, fmt.Errorf("%s: dsh zstd frame cannot be read: %w", path, readErr)
-		}
-		stream = bytes.NewReader(decompressed)
+	if !strings.HasSuffix(path, ".zstd") {
+		return readCaptured(bytes.NewReader(data), readDeepSeek)
 	}
-	s, err = readDeepSeek(stream)
+	decoder, err := zstd.NewReader(bytes.NewReader(data))
 	if err != nil {
-		s.SourcePath = path
+		return Session{SourceType: "deepseek"}, fmt.Errorf("dsh zstd frame cannot be decoded: %w", err)
+	}
+	defer decoder.Close()
+	s, err := readDeepSeek(decoder)
+	if err != nil {
 		return s, err
 	}
 	s.Original = data
-	s.SourcePath = path
-	if info, statErr := os.Stat(path); statErr == nil {
-		s.Updated = info.ModTime()
-	}
-	sum := sha256.Sum256([]byte("deepseek\x00" + path))
-	s.ID = hex.EncodeToString(sum[:16])
 	return s, nil
 }
 
@@ -583,15 +560,23 @@ func deepSeekLogGeneration(path string) int {
 // directory, only the newest generation of each log. dsh migrations leave
 // older generations behind, and reading them would resurrect replaced
 // history.
-func discoverDeepSeekFiles(root string) []string {
+func discoverDeepSeekFiles(root string) ([]string, []error) {
 	type candidate struct {
 		generation int
 		modTime    time.Time
 		path       string
 	}
 	byDir := make(map[string]candidate)
-	filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d == nil || d.IsDir() || d.Type()&os.ModeSymlink != 0 {
+	var errs []error
+	root = resolveRootSymlink(root)
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+			return nil
+		}
+		if d.IsDir() || d.Type()&os.ModeSymlink != 0 {
 			return nil
 		}
 		generation := deepSeekLogGeneration(path)
@@ -600,6 +585,9 @@ func discoverDeepSeekFiles(root string) []string {
 		}
 		info, err := d.Info()
 		if err != nil {
+			if !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
 			return nil
 		}
 		dir := filepath.Dir(path)
@@ -615,8 +603,11 @@ func discoverDeepSeekFiles(root string) []string {
 	for _, candidate := range byDir {
 		paths = append(paths, candidate.path)
 	}
+	if err != nil {
+		errs = append(errs, err)
+	}
 	sort.Strings(paths)
-	return paths
+	return paths, errs
 }
 
 // skippedDeepSeekLimitations reports the dsh content that stays out of the
@@ -628,6 +619,7 @@ func skippedDeepSeekLimitations(s Session) []string {
 	}
 	reasoning := 0
 	superseded := 0
+	injected := 0
 	unknown := make(map[string]int)
 	subagent := false
 	for _, line := range bytes.Split(s.Original, []byte{'\n'}) {
@@ -662,12 +654,19 @@ func skippedDeepSeekLimitations(s Session) []string {
 		switch event.Type {
 		case "user/message", "assistant/message":
 			var data struct {
+				Source struct {
+					Kind string `json:"kind"`
+				} `json:"source"`
 				Content json.RawMessage `json:"content"`
 				Message struct {
 					Content json.RawMessage `json:"content"`
 				} `json:"message"`
 			}
 			if json.Unmarshal(event.Data, &data) == nil {
+				// Same predicate the reader uses to skip the message.
+				if event.Type == "user/message" && data.Source.Kind != "user" {
+					injected++
+				}
 				reasoning += countDeepSeekReasoning(data.Content)
 				reasoning += countDeepSeekReasoning(data.Message.Content)
 				superseded += countDeepSeekToolCallBlocks(data.Message.Content)
@@ -681,20 +680,14 @@ func skippedDeepSeekLimitations(s Session) []string {
 	if superseded > 0 {
 		limitations = append(limitations, fmt.Sprintf("Source contains %d dsh tool-call block(s) superseded by their tool/call events; the original bytes retain them.", superseded))
 	}
+	if injected > 0 {
+		limitations = append(limitations, fmt.Sprintf("Source contains %d dsh non-user (plugin-injected) user message(s) with no cross-provider part; the original bytes retain them.", injected))
+	}
 	if subagent {
 		limitations = append(limitations, "Source is a dsh subagent run (origin=subagent); the original bytes retain the marker.")
 	}
 	if len(unknown) > 0 {
-		types := make([]string, 0, len(unknown))
-		for name := range unknown {
-			types = append(types, name)
-		}
-		sort.Strings(types)
-		parts := make([]string, 0, len(types))
-		for _, name := range types {
-			parts = append(parts, fmt.Sprintf("%s=%d", name, unknown[name]))
-		}
-		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented dsh event types (%s); the original bytes retain them.", strings.Join(parts, ", ")))
+		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented dsh event types (%s); the original bytes retain them.", formatCounts(unknown)))
 	}
 	return limitations
 }

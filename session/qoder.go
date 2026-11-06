@@ -8,13 +8,10 @@ package session
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +20,7 @@ import (
 // Qoder reads and writes the Qoder CLI JSONL session format.
 type Qoder struct{}
 
-func (Qoder) Read(r io.Reader) (Session, error) { return readQoder(r) }
+func (Qoder) Read(r io.Reader) (Session, error) { return readCaptured(r, readQoder) }
 
 func (Qoder) Write(w io.Writer, s Session) error { return writeQoder(w, s) }
 
@@ -179,6 +176,12 @@ func qoderInput(encoded string) json.RawMessage {
 	if encoded == "" {
 		return json.RawMessage(`{}`)
 	}
+	if !json.Valid([]byte(encoded)) {
+		// Streamed input of an unfinished call can be truncated; keep it
+		// as free text so the Session stays marshalable.
+		quoted, _ := json.Marshal(encoded)
+		return quoted
+	}
 	return json.RawMessage(encoded)
 }
 
@@ -286,19 +289,11 @@ func writeQoder(w io.Writer, s Session) error {
 // parseQoderFile reads one local Qoder session: the JSONL stream plus the
 // optional sidecar that carries the workspace. The sidecar is auxiliary; a
 // missing or unreadable sidecar only means the workspace stays empty.
-func parseQoderFile(path string) (Session, error) {
-	data, err := os.ReadFile(path)
-	s := Session{SourceType: "qoder", SourcePath: path}
+func parseQoderFile(f io.Reader, path string) (Session, error) {
+	s, err := (Qoder{}).Read(f)
 	if err != nil {
 		return s, err
 	}
-	s, err = readQoder(bytes.NewReader(data))
-	if err != nil {
-		s.SourcePath = path
-		return s, err
-	}
-	s.Original = data
-	s.SourcePath = path
 	if sidecar, err := os.ReadFile(strings.TrimSuffix(path, ".jsonl") + "-session.json"); err == nil {
 		var meta struct {
 			WorkingDir string `json:"working_dir"`
@@ -307,8 +302,6 @@ func parseQoderFile(path string) (Session, error) {
 			s.Workspace = meta.WorkingDir
 		}
 	}
-	sum := sha256.Sum256([]byte("qoder\x00" + path))
-	s.ID = hex.EncodeToString(sum[:16])
 	return s, nil
 }
 
@@ -355,16 +348,7 @@ func skippedQoderLimitations(s Session) []string {
 		limitations = append(limitations, fmt.Sprintf("Source contains %d Qoder meta message(s) injected as provider context; the original bytes retain them.", metaMessages))
 	}
 	if len(unknownParts) > 0 {
-		types := make([]string, 0, len(unknownParts))
-		for name := range unknownParts {
-			types = append(types, name)
-		}
-		sort.Strings(types)
-		parts := make([]string, 0, len(types))
-		for _, name := range types {
-			parts = append(parts, fmt.Sprintf("%s=%d", name, unknownParts[name]))
-		}
-		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented Qoder part types (%s); the original bytes retain them.", strings.Join(parts, ", ")))
+		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented Qoder part types (%s); the original bytes retain them.", formatCounts(unknownParts)))
 	}
 	return limitations
 }

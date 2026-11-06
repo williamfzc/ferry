@@ -3,7 +3,9 @@ package session
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -90,6 +92,7 @@ func TestConvertReportsDroppedToolCallStatus(t *testing.T) {
 func TestConvertReportsUnknownToolCallStatus(t *testing.T) {
 	original := []byte(`{"type":"session_meta","payload":{"id":"550e8400-e29b-41d4-a716-446655440000","cwd":"/work"}}
 {"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"function_call","status":"queued_for_retry","call_id":"call-unknown","name":"read","arguments":"{}"}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"function_call","status":"queued_for_retry","call_id":"call-unknown-2","name":"read","arguments":"{}"}}
 `)
 	source, err := (Codex{}).Read(bytes.NewReader(original))
 	if err != nil {
@@ -99,7 +102,7 @@ func TestConvertReportsUnknownToolCallStatus(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(strings.Join(transfer.Limitations, "\n"), `Tool call "call-unknown" source status "queued_for_retry" has no ACP equivalent`) {
+	if !strings.Contains(strings.Join(transfer.Limitations, "\n"), `Tool call status "queued_for_retry" on 2 call(s) has no ACP equivalent`) {
 		t.Fatalf("unknown status loss was not reported: %v", transfer.Limitations)
 	}
 }
@@ -183,7 +186,7 @@ func TestConvertReportsReorderedToolResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := toolResultOrder(readBack); !sameStringSlice(got, []string{"a", "b"}) {
+	if got := toolResultOrder(readBack); !slices.Equal(got, []string{"a", "b"}) {
 		t.Fatalf("unexpected target result order: %v", got)
 	}
 }
@@ -343,5 +346,381 @@ func TestValidateProjectionDetectsDroppedContent(t *testing.T) {
 	target := Session{Messages: []Message{{Role: "user", Parts: []ContentBlock{{Type: "text", Text: "changed"}}}}}
 	if err := validateProjection(source, target); err == nil {
 		t.Fatal("changed supported content was accepted")
+	}
+}
+
+func toolResultOrder(s Session) []string {
+	order := make([]string, 0)
+	for _, message := range s.Messages {
+		for _, part := range message.Parts {
+			if part.Type == "tool_result" && part.ToolResult != nil {
+				order = append(order, part.ToolResult.ID)
+			}
+		}
+	}
+	return order
+}
+
+func TestNullToolResultIsNotCollapsedToEmptyText(t *testing.T) {
+	const sourceText = `{"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work"}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"function_call","call_id":"call-null","name":"read","arguments":"{}"}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"function_call_output","call_id":"call-null","output":null}}
+`
+	source, err := (Codex{}).Read(bytes.NewBufferString(sourceText))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(source.Messages) != 2 {
+		t.Fatalf("expected call and result messages, got %d", len(source.Messages))
+	}
+	result := source.Messages[1].Parts[0].ToolResult
+	if result == nil || result.Content != "null" || string(result.RawContent) != "null" {
+		t.Fatalf("null result was changed while reading: %+v", result)
+	}
+
+	transfer, err := Convert(source, "claude")
+	if err != nil {
+		t.Fatalf("null result conversion failed: %v", err)
+	}
+	if !strings.Contains(string(transfer.Target), `"content":"null"`) {
+		t.Fatalf("target did not retain null as visible JSON text: %s", transfer.Target)
+	}
+	if !strings.Contains(strings.Join(transfer.Limitations, "\n"), "structured tool results") {
+		t.Fatalf("null result was not reported as structured content: %v", transfer.Limitations)
+	}
+}
+
+func TestNullToolResultTextHelpersPreserveValue(t *testing.T) {
+	for name, got := range map[string]string{
+		"generic": text([]byte(" null ")),
+		"pi":      piToolResultText([]byte("null")),
+		"trae":    traeToolResultText([]byte("null")),
+	} {
+		if got != "null" {
+			t.Errorf("%s helper returned %q for JSON null", name, got)
+		}
+	}
+	content := piToolResultContent(&ToolResult{RawContent: []byte("null")})
+	blocks, ok := content.([]any)
+	if !ok || len(blocks) != 1 || blocks[0].(map[string]any)["text"] != "null" {
+		t.Fatalf("Pi writer dropped JSON null result: %#v", content)
+	}
+}
+
+func TestNullToolResultCountsAsStructured(t *testing.T) {
+	s := Session{Messages: []Message{{Role: "tool", Parts: []ContentBlock{{
+		Type: "tool_result", ToolResult: &ToolResult{ID: "call-null", RawContent: []byte("null")},
+	}}}}}
+	if got := structuredResultCount(s); got != 1 {
+		t.Fatalf("JSON null was not counted as structured output: %d", got)
+	}
+}
+
+// The Claude error flag survives Claude and OpenCode round trips and
+// is reported when the target has no flag.
+func TestToolResultErrorFlag(t *testing.T) {
+	source := []byte(`{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174010","cwd":"/example","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"run it"}}
+{"type":"assistant","sessionId":"123e4567-e89b-12d3-a456-426614174010","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"x"}}]}}
+{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174010","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"boom","is_error":true}]}}
+`)
+	s, err := (Claude{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var flagged int
+	for _, m := range s.Messages {
+		for _, p := range m.Parts {
+			if p.Type == "tool_result" && p.ToolResult.IsError {
+				flagged++
+			}
+		}
+	}
+	if flagged != 1 {
+		t.Fatalf("is_error not read: %d", flagged)
+	}
+	var claudeBack bytes.Buffer
+	if err := (Claude{}).Write(&claudeBack, s); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(claudeBack.String(), `"is_error":true`) {
+		t.Fatal("is_error not written back to Claude")
+	}
+	transfer, err := Convert(s, "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := (OpenCode{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var errorStates int
+	for _, m := range target.Messages {
+		for _, p := range m.Parts {
+			if p.Type == "tool_result" && p.ToolResult.IsError {
+				errorStates++
+			}
+		}
+	}
+	if errorStates != 1 {
+		t.Fatalf("OpenCode error status not preserved: %d", errorStates)
+	}
+	codexTransfer, err := Convert(s, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(codexTransfer.Limitations, "\n"), "flagged as errors") {
+		t.Fatalf("dropped error flag not reported: %v", codexTransfer.Limitations)
+	}
+	geminiTransfer, err := Convert(s, "gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(geminiTransfer.Limitations, "\n"), "has no error flag") {
+		t.Fatalf("Gemini error support was incorrectly reported as loss: %v", geminiTransfer.Limitations)
+	}
+	geminiTarget, err := (Gemini{}).Read(bytes.NewReader(geminiTransfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var geminiErrors int
+	for _, m := range geminiTarget.Messages {
+		for _, p := range m.Parts {
+			if p.Type == "tool_result" && p.ToolResult != nil && p.ToolResult.IsError {
+				geminiErrors++
+			}
+		}
+	}
+	if geminiErrors != 1 {
+		t.Fatalf("Gemini did not reconstruct the failed tool result: %d", geminiErrors)
+	}
+}
+
+// A timestamp the source carried must not silently change.
+func TestProjectionRejectsChangedTimestamp(t *testing.T) {
+	source := Session{Messages: []Message{{Role: "user", Timestamp: "2026-01-01T00:00:00Z", Parts: []ContentBlock{{Type: "text", Text: "hi"}}}}}
+	target := Session{Messages: []Message{{Role: "user", Timestamp: "2026-01-02T00:00:00Z", Parts: []ContentBlock{{Type: "text", Text: "hi"}}}}}
+	if err := validateProjection(source, target); err == nil || !strings.Contains(err.Error(), "timestamp") {
+		t.Fatalf("changed timestamp not detected: %v", err)
+	}
+}
+
+// Codex custom tool calls carry free-text input and structured output; both
+// must cross providers without silent loss.
+func TestCustomToolCallCrossProvider(t *testing.T) {
+	source := []byte(codexTestMeta +
+		`{"type":"response_item","timestamp":"2026-10-27T00:00:01Z","payload":{"type":"custom_tool_call","call_id":"c1","name":"exec","input":"console.log('hi')"}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-10-27T00:00:02Z","payload":{"type":"custom_tool_call_output","call_id":"c1","output":{"stdout":"hi\n","exit":0}}}` + "\n")
+	s, err := (Codex{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back bytes.Buffer
+	if err := (Codex{}).Write(&back, s); err != nil {
+		t.Fatal(err)
+	}
+	again, err := (Codex{}).Read(&back)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := again.Messages[0].Parts[0].ToolCall
+	var text string
+	if err := json.Unmarshal(call.Input, &text); err != nil || text != "console.log('hi')" {
+		t.Fatalf("free-text input not preserved: %s", call.Input)
+	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if !strings.Contains(joined, "1 custom tool calls with free-text input") {
+		t.Fatalf("free-text wrapping not reported: %v", transfer.Limitations)
+	}
+	if !strings.Contains(joined, "1 structured tool results serialized as JSON text") {
+		t.Fatalf("structured output not reported: %v", transfer.Limitations)
+	}
+	target, err := (Claude{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wrappedInput bool
+	var serialized string
+	for _, m := range target.Messages {
+		for _, p := range m.Parts {
+			if p.Type == "tool_call" && strings.Contains(string(p.ToolCall.Input), "console.log('hi')") {
+				wrappedInput = true
+			}
+			if p.Type == "tool_result" {
+				serialized = p.ToolResult.Content
+			}
+		}
+	}
+	if !wrappedInput {
+		t.Fatal("free-text input missing from Claude target")
+	}
+	if !strings.Contains(serialized, `"exit":0`) {
+		t.Fatalf("structured output not serialized exactly: %q", serialized)
+	}
+}
+
+// Parallel tool calls (two calls, then two results) must convert to every
+// provider that couples or splits calls and results.
+func TestParallelToolCallsConvert(t *testing.T) {
+	source := []byte(`{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174030","cwd":"/example","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"run both"}}
+{"type":"assistant","sessionId":"123e4567-e89b-12d3-a456-426614174030","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"Read","input":{"p":"1"}},{"type":"tool_use","id":"b","name":"Read","input":{"p":"2"}}]}}
+{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174030","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":"one"},{"type":"tool_result","tool_use_id":"b","content":"two"}]}}
+`)
+	s, err := (Claude{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"codex", "opencode"} {
+		t.Run(target, func(t *testing.T) {
+			transfer, err := Convert(s, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var results int
+			readBack, err := convertTarget(t, transfer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, m := range readBack.Messages {
+				for _, p := range m.Parts {
+					if p.Type == "tool_result" {
+						results++
+					}
+				}
+			}
+			if results != 2 {
+				t.Fatalf("parallel results lost in %s: %d", target, results)
+			}
+		})
+	}
+}
+
+func convertTarget(t *testing.T, transfer Transfer) (Session, error) {
+	t.Helper()
+	switch transfer.TargetType {
+	case "claude":
+		return (Claude{}).Read(bytes.NewReader(transfer.Target))
+	case "codex":
+		return (Codex{}).Read(bytes.NewReader(transfer.Target))
+	case "gemini":
+		return (Gemini{}).Read(bytes.NewReader(transfer.Target))
+	case "opencode":
+		return (OpenCode{}).Read(bytes.NewReader(transfer.Target))
+	}
+	return Session{}, fmt.Errorf("unknown target %q", transfer.TargetType)
+}
+
+func TestConvertReportsUnpairedToolCallsAndResultsWithoutContent(t *testing.T) {
+	source := Session{
+		SourceType: "claude",
+		NativeID:   "550e8400-e29b-41d4-a716-446655440000",
+		Workspace:  "/work",
+		Original: []byte(`{"type":"user","sessionId":"550e8400-e29b-41d4-a716-446655440000","cwd":"/work","message":{"role":"user","content":"hello"}}
+`),
+		Messages: []Message{
+			{Role: "assistant", Timestamp: "2026-01-01T00:00:00Z", Parts: []ContentBlock{
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "open-call", Name: "read", Input: []byte(`{"path":"TOP_SECRET_INPUT"}`)}},
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "duplicate", Name: "read", Input: []byte(`{"path":"duplicate-a"}`)}},
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "duplicate", Name: "read", Input: []byte(`{"path":"duplicate-b"}`)}},
+			}},
+			{Role: "tool", Timestamp: "2026-01-01T00:00:01Z", Parts: []ContentBlock{
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "duplicate", Content: "TOP_SECRET_OUTPUT"}},
+			}},
+			{Role: "assistant", Timestamp: "2026-01-01T00:00:02Z", Parts: []ContentBlock{
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "parallel-a", Name: "read", Input: []byte(`{"path":"a"}`)}},
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "parallel-b", Name: "read", Input: []byte(`{"path":"b"}`)}},
+			}},
+			{Role: "tool", Timestamp: "2026-01-01T00:00:03Z", Parts: []ContentBlock{
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "parallel-b", Content: "b"}},
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "parallel-a", Content: "a"}},
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "orphan-result", Content: "orphan"}},
+			}},
+		},
+	}
+
+	transfer, err := Convert(source, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limitations := strings.Join(transfer.Limitations, "\n")
+	for _, want := range []string{
+		"2 unpaired tool calls without results",
+		"duplicate=1",
+		"open-call=1",
+		"1 unpaired tool results without calls",
+		"orphan-result=1",
+	} {
+		if !strings.Contains(limitations, want) {
+			t.Fatalf("limitations missing %q: %v", want, transfer.Limitations)
+		}
+	}
+	for _, secret := range []string{"TOP_SECRET_INPUT", "TOP_SECRET_OUTPUT"} {
+		if strings.Contains(limitations, secret) {
+			t.Fatalf("limitation exposed tool content %q: %s", secret, limitations)
+		}
+	}
+
+	readBack, err := (Codex{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatalf("target is not readable: %v", err)
+	}
+	var openCalls, duplicateCalls int
+	for _, message := range readBack.Messages {
+		for _, part := range message.Parts {
+			if part.Type != "tool_call" || part.ToolCall == nil {
+				continue
+			}
+			switch part.ToolCall.ID {
+			case "open-call":
+				openCalls++
+			case "duplicate":
+				duplicateCalls++
+			}
+		}
+	}
+	if openCalls != 1 || duplicateCalls != 2 {
+		t.Fatalf("open or duplicate calls were not preserved: open=%d duplicate=%d messages=%+v", openCalls, duplicateCalls, readBack.Messages)
+	}
+}
+
+func TestConvertReportsBalancedDuplicateToolIDsWithoutContent(t *testing.T) {
+	source := Session{
+		SourceType: "claude",
+		NativeID:   "550e8400-e29b-41d4-a716-446655440001",
+		Workspace:  "/work",
+		Original: []byte(`{"type":"user","sessionId":"550e8400-e29b-41d4-a716-446655440001","cwd":"/work","message":{"role":"user","content":"hello"}}
+`),
+		Messages: []Message{
+			{Role: "assistant", Timestamp: "2026-01-01T00:00:00Z", Parts: []ContentBlock{
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "balanced", Name: "read", Input: []byte(`{"path":"DUPLICATE_SECRET_A"}`)}},
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "balanced", Name: "read", Input: []byte(`{"path":"DUPLICATE_SECRET_B"}`)}},
+			}},
+			{Role: "tool", Timestamp: "2026-01-01T00:00:01Z", Parts: []ContentBlock{
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "balanced", Content: "DUPLICATE_OUTPUT_A"}},
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "balanced", Content: "DUPLICATE_OUTPUT_B"}},
+			}},
+		},
+	}
+
+	transfer, err := Convert(source, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limitations := strings.Join(transfer.Limitations, "\n")
+	for _, want := range []string{
+		"duplicate tool call IDs (balanced=2)",
+		"duplicate tool result IDs (balanced=2)",
+	} {
+		if !strings.Contains(limitations, want) {
+			t.Fatalf("limitations missing %q: %v", want, transfer.Limitations)
+		}
+	}
+	for _, secret := range []string{"DUPLICATE_SECRET_A", "DUPLICATE_SECRET_B", "DUPLICATE_OUTPUT_A", "DUPLICATE_OUTPUT_B"} {
+		if strings.Contains(limitations, secret) {
+			t.Fatalf("limitation exposed tool content %q: %s", secret, limitations)
+		}
 	}
 }

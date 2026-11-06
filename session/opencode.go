@@ -645,15 +645,6 @@ type pendingCall struct {
 	blocked bool
 }
 
-func removePendingCall(open []*pendingCall, done *pendingCall) []*pendingCall {
-	for i, entry := range open {
-		if entry == done {
-			return append(open[:i], open[i+1:]...)
-		}
-	}
-	return open
-}
-
 func (OpenCode) Write(w io.Writer, s Session) error {
 	doc, err := buildOpenCodeDoc(s)
 	if err != nil {
@@ -723,7 +714,6 @@ func buildOpenCodeDoc(s Session) (openCodeOutDoc, error) {
 		Directory: s.Workspace, Time: openCodeTimeSpan{Created: times[0], Updated: updated},
 	}
 	calls := make(map[string]*pendingCall)
-	var open []*pendingCall
 	partSeq := 0
 	messageID := func() string {
 		partSeq++
@@ -757,9 +747,9 @@ func buildOpenCodeDoc(s Session) (openCodeOutDoc, error) {
 				// result can only attach to a call that no other content has
 				// followed. Text blocks every still-open call; other calls
 				// do not, which keeps parallel tool calls convertible.
-				for _, open := range calls {
-					if open.part.State.Status == "pending" {
-						open.blocked = true
+				for _, c := range calls {
+					if c.part.State.Status == "pending" {
+						c.blocked = true
 					}
 				}
 			case "tool_call":
@@ -779,7 +769,6 @@ func buildOpenCodeDoc(s Session) (openCodeOutDoc, error) {
 				}
 				entry := &pendingCall{part: toolPart}
 				calls[p.ToolCall.ID] = entry
-				open = append(open, entry)
 				visible = append(visible, toolPart)
 			case "tool_result":
 				if p.ToolResult == nil || p.ToolResult.ID == "" || (m.Role != "user" && m.Role != "tool") {
@@ -807,7 +796,6 @@ func buildOpenCodeDoc(s Session) (openCodeOutDoc, error) {
 					previous.part.State.Status = "completed"
 				}
 				previous.part.State.Time.End = created
-				open = removePendingCall(open, previous)
 			default:
 				return doc, fmt.Errorf("message %d part %d: unsupported content %q", i, j, p.Type)
 			}
@@ -910,14 +898,5 @@ func formatOpenCodeCounts(label string, counts map[string]int) string {
 	if len(counts) == 0 {
 		return ""
 	}
-	types := make([]string, 0, len(counts))
-	for name := range counts {
-		types = append(types, name)
-	}
-	sort.Strings(types)
-	parts := make([]string, 0, len(types))
-	for _, name := range types {
-		parts = append(parts, fmt.Sprintf("%s=%d", name, counts[name]))
-	}
-	return fmt.Sprintf("OpenCode source contains unrepresented %s (%s); the original bytes retain them.", label, strings.Join(parts, ", "))
+	return fmt.Sprintf("OpenCode source contains unrepresented %s (%s); the original bytes retain them.", label, formatCounts(counts))
 }

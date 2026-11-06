@@ -432,3 +432,216 @@ func TestGeminiWriteRejectsUnsupportedFunctionResponseFields(t *testing.T) {
 		}
 	}
 }
+
+func TestGeminiReadLegacyJSONSkipsIDLessUnknownRecord(t *testing.T) {
+	data := []byte(`{"sessionId":"legacy","messages":[{"type":"info","content":"x"},{"id":"u","type":"user","timestamp":"2026-01-01T00:00:00Z","content":"hello"}]}`)
+	s, err := (Gemini{}).Read(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 1 || s.Messages[0].Parts[0].Text != "hello" {
+		t.Fatalf("legacy record not parsed: %+v", s.Messages)
+	}
+	if got := strings.Join(skippedGeminiMessageLimitations(s), "\n"); !strings.Contains(got, "info") {
+		t.Fatalf("skipped info record not reported: %q", got)
+	}
+	if _, err := (Gemini{}).Read(bytes.NewReader([]byte(`{"sessionId":"legacy","messages":[{"type":"user","content":"hello"}]}`))); err == nil {
+		t.Fatal("id-less user record was accepted")
+	}
+}
+
+// Gemini metadata results must split into tool-role messages so every
+// writer can represent them.
+func TestGeminiResultsSplitForEveryTarget(t *testing.T) {
+	source := []byte(`{"sessionId":"123e4567-e89b-12d3-a456-426614174040","projectHash":"deadbeef","startTime":"2026-01-01T00:00:00Z","lastUpdated":"2026-01-01T00:00:02Z","messages":[{"id":"u1","type":"user","timestamp":"2026-01-01T00:00:00Z","content":"read it"},{"id":"a1","type":"gemini","timestamp":"2026-01-01T00:00:01Z","content":[{"text":"opening"}],"toolCalls":[{"id":"call-1","name":"read_file","args":{"path":"x"},"status":"success","timestamp":"2026-01-01T00:00:01Z","result":[{"text":"ok"}]}]}]}`)
+	s, err := (Gemini{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 3 || s.Messages[2].Role != "tool" || s.Messages[2].Parts[0].ToolResult == nil {
+		t.Fatalf("result not split: %+v", s.Messages)
+	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBack, err := convertTarget(t, transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var results int
+	for _, m := range readBack.Messages {
+		for _, p := range m.Parts {
+			if p.Type == "tool_result" {
+				results++
+			}
+		}
+	}
+	if results != 1 {
+		t.Fatalf("result lost in claude target")
+	}
+	// Codex and OpenCode need an absolute workspace; a Gemini file only has
+	// the project hash, so those targets reject instead of inventing one.
+	if _, err := Convert(s, "codex"); err == nil || !strings.Contains(err.Error(), "workspace") {
+		t.Fatalf("gemini source must not invent a workspace for codex: %v", err)
+	}
+}
+
+// Codex marks calls "completed"; Gemini accepts it as success. A paired
+// result also derives the status for sources that carry none.
+func TestGeminiTargetAcceptsForeignToolCalls(t *testing.T) {
+	codexSource := []byte(codexTestMeta +
+		`{"type":"response_item","timestamp":"2026-10-27T00:00:01Z","payload":{"type":"function_call","status":"completed","call_id":"c1","name":"read","arguments":"{\"path\":\"x\"}"}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-10-27T00:00:02Z","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}` + "\n")
+	codexSession, err := (Codex{}).Read(bytes.NewReader(codexSource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	codexSession.Workspace = "/example"
+	transfer, err := Convert(codexSession, "gemini")
+	if err != nil {
+		t.Fatalf("codex->gemini: %v", err)
+	}
+	if !strings.Contains(string(transfer.Target), `"status":"success"`) {
+		t.Fatalf("completed status not mapped:\n%s", transfer.Target)
+	}
+	readBack, err := convertTarget(t, transfer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readBack.Messages[0].Parts[0].ToolCall.Status; got != "completed" {
+		t.Fatalf("Gemini target did not preserve completed status: %q", got)
+	}
+	if strings.Contains(strings.Join(transfer.Limitations, "\n"), "status \"completed\" was not preserved") {
+		t.Fatalf("status preservation was incorrectly reported as loss: %v", transfer.Limitations)
+	}
+
+	claudeSource := []byte(`{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174041","cwd":"/example","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"run"}}
+{"type":"assistant","sessionId":"123e4567-e89b-12d3-a456-426614174041","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"Bash","input":{"command":"x"}}]}}
+{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174041","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"c1","content":"done"}]}}
+`)
+	claudeSession, err := (Claude{}).Read(bytes.NewReader(claudeSource))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Convert(claudeSession, "gemini"); err != nil {
+		t.Fatalf("claude->gemini: %v", err)
+	}
+
+	opencodeSession := readOpenCodeFixture(t)
+	if _, err := Convert(opencodeSession, "gemini"); err != nil {
+		t.Fatalf("opencode->gemini: %v", err)
+	}
+}
+
+// A result flag must win over the call status in the Gemini projection, and
+// the resulting status change must be reported.
+func TestGeminiResultFlagWinsOverCallStatus(t *testing.T) {
+	original := []byte(`{"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work"}}
+{"type":"history_mutation","timestamp":"2026-01-01T00:00:01Z","payload":{"operation":"append","items":[{"type":"function_call","call_id":"c9","status":"completed","name":"run","arguments":"{}"},{"type":"function_call_output","call_id":"c9","output":"boom","is_error":true}]}}
+`)
+	s, err := (Trae{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "gemini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := (Gemini{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := false
+	for _, message := range target.Messages {
+		for _, part := range message.Parts {
+			if part.Type == "tool_result" && part.ToolResult != nil && part.ToolResult.IsError {
+				failed = true
+			}
+		}
+	}
+	if !failed {
+		t.Fatalf("failed tool became a success in the gemini projection: %+v", target.Messages)
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if !strings.Contains(joined, `status changed from "completed"`) {
+		t.Fatalf("status conflict was not reported: %v", transfer.Limitations)
+	}
+}
+
+// Integers above float64 precision must survive Gemini writes and stay
+// distinguishable in projection normalization.
+func TestExactIntegersSurviveGeminiWrite(t *testing.T) {
+	left, err := canonicalToolInput(json.RawMessage(`{"n":9007199254740993}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	right, err := canonicalToolInput(json.RawMessage(`{"n":9007199254740992}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if left == right {
+		t.Fatal("canonicalization calls two different large integers equal")
+	}
+	source := []byte(`{"sessionId":"123e4567-e89b-12d3-a456-426614174020","projectHash":"deadbeef","startTime":"2026-01-01T00:00:00Z","lastUpdated":"2026-01-01T00:00:01Z","messages":[{"id":"a1","type":"gemini","timestamp":"2026-01-01T00:00:01Z","content":[{"text":"checking"}],"toolCalls":[{"id":"call-1","name":"read_file","args":{"n":9007199254740993},"status":"success","timestamp":"2026-01-01T00:00:01Z"}]}]}`)
+	s, err := (Gemini{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Workspace = "/example"
+	var out bytes.Buffer
+	if err := (Gemini{}).Write(&out, s); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "9007199254740993") {
+		t.Fatalf("large integer corrupted in Gemini output:\n%s", out.String())
+	}
+	back, err := (Gemini{}).Read(&out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input string
+	for _, m := range back.Messages {
+		for _, p := range m.Parts {
+			if p.Type == "tool_call" {
+				input = string(p.ToolCall.Input)
+			}
+		}
+	}
+	if !strings.Contains(input, "9007199254740993") {
+		t.Fatalf("large integer corrupted on read-back: %s", input)
+	}
+}
+
+// A null $set.messages must not clear the session; the official
+// history service only replaces actual arrays.
+func TestGeminiSetMessagesNullKeepsMessages(t *testing.T) {
+	source := []byte(
+		`{"sessionId":"gem-null","projectHash":"deadbeef","startTime":"2026-01-01T00:00:00Z","lastUpdated":"2026-01-01T00:00:01Z"}` + "\n" +
+			`{"id":"u1","type":"user","timestamp":"2026-01-01T00:00:00Z","content":"hello"}` + "\n" +
+			`{"$set":{"messages":null}}` + "\n")
+	s, err := (Gemini{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 1 || s.Messages[0].Parts[0].Text != "hello" {
+		t.Fatalf("null $set.messages cleared the session: %+v", s.Messages)
+	}
+}
+
+// Gemini model thoughts are counted and reported, not folded into a
+// generic metadata note.
+func TestGeminiThoughtsReported(t *testing.T) {
+	source := []byte(`{"sessionId":"gem-thoughts","projectHash":"deadbeef","startTime":"2026-01-01T00:00:00Z","lastUpdated":"2026-01-01T00:00:01Z","messages":[{"id":"u1","type":"user","timestamp":"2026-01-01T00:00:00Z","content":"hello"},{"id":"a1","type":"gemini","timestamp":"2026-01-01T00:00:01Z","content":[{"text":"answer"}],"thoughts":[{"subject":"plan","description":"thinking"}]}]}`)
+	s, err := (Gemini{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(transfer.Limitations, "\n"), "1 messages with model thoughts") {
+		t.Fatalf("thoughts not reported: %v", transfer.Limitations)
+	}
+}

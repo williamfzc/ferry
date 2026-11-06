@@ -9,6 +9,9 @@ import (
 )
 
 // Discover isolates errors to individual files and returns them alongside usable sessions.
+// Provider roots derive from home, except that DSH_HOME and COPILOT_HOME in the
+// process environment override the dsh and Copilot roots, as the CLIs do.
+// A provider root that is itself a symlink is followed; symlinks below it are not.
 func Discover(home string) ([]Session, []error) {
 	var sessions []Session
 	var errs []error
@@ -27,8 +30,9 @@ func Discover(home string) ([]Session, []error) {
 		{name: "pi", dir: filepath.Join(home, ".pi", "agent", "sessions"), exts: map[string]bool{".jsonl": true}},
 		{name: "qoder", dir: filepath.Join(home, ".qoder", "projects"), exts: map[string]bool{".jsonl": true}},
 		{name: "qwen", dir: filepath.Join(home, ".qwen", "projects"), exts: map[string]bool{".jsonl": true}},
-		{name: "copilot", dir: filepath.Join(home, ".copilot", "session-state"), exts: map[string]bool{".jsonl": true}},
+		{name: "copilot", dir: envRoot(home, "COPILOT_HOME", ".copilot", "session-state"), exts: map[string]bool{".jsonl": true}},
 	} {
+		src.dir = resolveRootSymlink(src.dir)
 		err := filepath.WalkDir(src.dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				if os.IsNotExist(err) {
@@ -70,7 +74,9 @@ func Discover(home string) ([]Session, []error) {
 			errs = append(errs, err)
 		}
 	}
-	for _, path := range discoverDeepSeekFiles(deepSeekSessionsRoot(home)) {
+	paths, walkErrs := discoverDeepSeekFiles(envRoot(home, "DSH_HOME", ".dsh", "sessions"))
+	errs = append(errs, walkErrs...)
+	for _, path := range paths {
 		s, e := Parse(path, "deepseek")
 		if e != nil {
 			errs = append(errs, e)
@@ -82,23 +88,36 @@ func Discover(home string) ([]Session, []error) {
 	return sessions, errs
 }
 
-// deepSeekSessionsRoot resolves the dsh sessions directory, honoring the
-// DSH_HOME override that the dsh CLI itself expands.
-func deepSeekSessionsRoot(home string) string {
-	if env := os.Getenv("DSH_HOME"); env != "" {
-		if expanded, err := filepath.Abs(expandHome(env)); err == nil {
-			return filepath.Join(expanded, "sessions")
+// envRoot resolves a provider root, honoring a CLI home override such as
+// DSH_HOME or COPILOT_HOME that replaces <home>/<defaultDir>.
+func envRoot(home, env, defaultDir, sub string) string {
+	if v := os.Getenv(env); v != "" {
+		if expanded, err := filepath.Abs(expandHome(home, v)); err == nil {
+			return filepath.Join(expanded, sub)
 		}
 	}
-	return filepath.Join(home, ".dsh", "sessions")
+	return filepath.Join(home, defaultDir, sub)
 }
 
-func expandHome(path string) string {
+// resolveRootSymlink follows a provider root that is itself a symlink, which
+// WalkDir would otherwise report without descending. Other roots are returned
+// unchanged so that session paths keep the caller's spelling.
+func resolveRootSymlink(root string) string {
+	if info, err := os.Lstat(root); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if r, err := filepath.EvalSymlinks(root); err == nil {
+			return r
+		}
+	}
+	return root
+}
+
+// expandHome resolves a leading ~ against home.
+func expandHome(home, path string) string {
 	if path == "~" {
-		return os.Getenv("HOME")
+		return home
 	}
 	if strings.HasPrefix(path, "~/") {
-		return filepath.Join(os.Getenv("HOME"), path[2:])
+		return filepath.Join(home, path[2:])
 	}
 	return path
 }

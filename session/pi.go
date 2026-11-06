@@ -309,12 +309,10 @@ func piEntryMessages(entry piEntry) ([]Message, error) {
 				ID: message.ToolCallID, Content: piToolResultText(message.Content), IsError: message.IsError, RawContent: rawContent,
 			}}}}}, nil
 		case "system":
-			// Pi's system, custom, and bash messages are provider-specific context.
-			// Their exact records remain in Original, but the common model has no
-			// honest representation for them.
+			// Pi system messages are provider-specific context. The exact record
+			// stays in Original, but the common model has no honest
+			// representation for it.
 			return nil, nil
-		case "custom", "bashExecution":
-			return nil, fmt.Errorf("Pi entry %q message role %q cannot be represented", entry.ID, message.Role)
 		default:
 			return nil, fmt.Errorf("Pi entry %q message role %q cannot be represented", entry.ID, message.Role)
 		}
@@ -638,9 +636,6 @@ func piWriteContent(part ContentBlock) (any, error) {
 }
 
 func piValidateToolResult(result *ToolResult) error {
-	if result.IsError && result.ID == "" {
-		return fmt.Errorf("tool result has no id")
-	}
 	if len(result.RawContent) > 0 {
 		if _, err := piToolResultBlocks(result.RawContent); err == nil {
 			return nil

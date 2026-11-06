@@ -286,3 +286,106 @@ func TestPiConvertAcceptsForeignStatusAndFreeText(t *testing.T) {
 		t.Fatalf("missing conversion limitations: %v", transfer.Limitations)
 	}
 }
+
+func TestPiConvertReportsCompactedAwayMessages(t *testing.T) {
+	data := []byte(`{"type":"session","version":3,"id":"pi","timestamp":"2026-01-01T00:00:00Z","cwd":"/work"}` + "\n" +
+		`{"type":"message","id":"u1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"user","content":"old"}}` + "\n" +
+		`{"type":"message","id":"u2","parentId":"u1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"kept"}}` + "\n" +
+		`{"type":"message","id":"s1","parentId":"u2","timestamp":"2026-01-01T00:00:02Z","message":{"role":"system","content":"sys"}}` + "\n" +
+		`{"type":"compaction","id":"c","parentId":"s1","timestamp":"2026-01-01T00:00:03Z","summary":"summary","firstKeptEntryId":"u2"}` + "\n" +
+		`{"type":"message","id":"u3","parentId":"c","timestamp":"2026-01-01T00:00:04Z","message":{"role":"user","content":"new"}}` + "\n")
+	s, err := (Pi{}).Read(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"codex", "trae", "copilot"} {
+		transfer, err := Convert(s, target)
+		if err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+		got := strings.Join(transfer.Limitations, "\n")
+		// The system message is reported by role, not as compacted away.
+		if !strings.Contains(got, "compacted_away=1") || !strings.Contains(got, "message.role=system=1") {
+			t.Fatalf("%s: compacted-away message not reported: %s", target, got)
+		}
+		// Every one of these targets writes the summary natively.
+		if strings.Contains(got, "compaction=") {
+			t.Fatalf("%s: summary reported as unrepresented: %s", target, got)
+		}
+	}
+}
+
+// Claude stores tool results in user records; the Pi writer must accept that
+// shape instead of rejecting most real Claude sessions.
+func TestPiAcceptsClaudeToolResultUserRecord(t *testing.T) {
+	original := []byte(`{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":"run the check"}}
+{"type":"assistant","sessionId":"123e4567-e89b-12d3-a456-426614174000","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"check","input":{"path":"x"}}]}}
+{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174000","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"failed","is_error":true}]}}
+`)
+	s, err := (Claude{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := (Pi{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, message := range target.Messages {
+		for _, part := range message.Parts {
+			if part.Type == "tool_result" && part.ToolResult != nil && part.ToolResult.ID == "call-1" && part.ToolResult.IsError {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("pi target lost the claude tool result: %+v", target.Messages)
+	}
+}
+
+// Empty Pi messages vanish from the projection; the report must say so.
+func TestPiEmptyMessagesAreReported(t *testing.T) {
+	original := []byte(`{"type":"session","version":3,"id":"pid","timestamp":"2026-01-01T00:00:00Z"}
+{"type":"message","id":"e1","parentId":null,"timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[]}}
+{"type":"message","id":"e2","parentId":"e1","timestamp":"2026-01-01T00:00:02Z","message":{"role":"user","content":"visible"}}
+`)
+	s, err := (Pi{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if !strings.Contains(joined, "message.content=<empty>") {
+		t.Fatalf("empty pi message was not reported: %v", transfer.Limitations)
+	}
+}
+
+// Pi carries block-shaped structured results natively; only shapes it cannot
+// represent may be reported as flattened to JSON text.
+func TestPiStructuredResultLimitationIsAccurate(t *testing.T) {
+	original := []byte(`{"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work"}}
+{"type":"history_mutation","timestamp":"2026-01-01T00:00:01Z","payload":{"operation":"append","items":[{"type":"function_call","call_id":"c1","name":"run","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":[{"type":"text","text":"native blocks"}]},{"type":"function_call","call_id":"c2","name":"run","arguments":"{}"},{"type":"function_call_output","call_id":"c2","output":{"odd":"shape"}}]}}
+`)
+	s, err := (Trae{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "pi")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if !strings.Contains(joined, "1 structured tool results serialized as JSON text") {
+		t.Fatalf("expected exactly the unrepresentable shape to be reported: %v", transfer.Limitations)
+	}
+	if !strings.Contains(string(transfer.Target), "native blocks") {
+		t.Fatal("pi target lost the native block content")
+	}
+}

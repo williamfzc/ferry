@@ -1,6 +1,6 @@
 .PHONY: check test cover
 check: test
-	@test -z "$$(gofmt -l session)"
+	@test -z "$$(gofmt -l .)"
 
 test:
 	go vet ./...

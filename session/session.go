@@ -149,21 +149,44 @@ func Parse(path, source string) (Session, error) {
 	case "pi":
 		s, err = (Pi{}).Read(f)
 	case "qoder":
-		s, err = parseQoderFile(path)
+		s, err = parseQoderFile(f, path)
 	case "deepseek":
-		s, err = parseDeepSeekFile(path)
+		s, err = parseDeepSeekFile(f, path)
 	case "qwen":
-		s, err = parseQwenFile(path)
+		s, err = (Qwen{}).Read(f)
 	case "copilot":
-		s, err = parseCopilotFile(path)
+		s, err = (Copilot{}).Read(f)
 	default:
 		s, err = readOriginal(f, source, path)
+	}
+	if err != nil && !strings.HasPrefix(err.Error(), path) {
+		// Readers that format "%s:%d:" with an empty SourcePath yield ":1: ...";
+		// join those directly so the location reads "path:1: ...".
+		if strings.HasPrefix(err.Error(), ":") {
+			err = fmt.Errorf("%s%w", path, err)
+		} else {
+			err = fmt.Errorf("%s: %w", path, err)
+		}
 	}
 	s.SourcePath = path
 	s.Updated = info.ModTime()
 	sum := sha256.Sum256([]byte(source + "\x00" + path))
 	s.ID = hex.EncodeToString(sum[:16])
 	return s, err
+}
+
+// readCaptured buffers r once, parses it, and keeps the exact bytes as Original.
+func readCaptured(r io.Reader, read func(io.Reader) (Session, error)) (Session, error) {
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return Session{}, err
+	}
+	s, err := read(bytes.NewReader(data))
+	if err != nil {
+		return s, err
+	}
+	s.Original = data
+	return s, nil
 }
 
 // readOriginal retains the exact input, including records not understood by Ferry.
@@ -293,13 +316,8 @@ func read(rdr io.Reader, source, path string) (Session, error) {
 			}
 		} else {
 			// Claude's outer record type is authoritative. The nested role is
-			// redundant and is absent in some valid exports. Ferry's summary
-			// extension is the one intentional exception: it uses an assistant
-			// envelope because Claude has no summary envelope of its own.
+			// redundant and is absent in some valid exports.
 			m.Role = r.Type
-			if b.Role == "summary" {
-				m.Role = "summary"
-			}
 			m.Parts = contentParts(b.Content)
 		}
 		if len(m.Parts) > 0 {

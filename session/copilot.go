@@ -6,22 +6,18 @@ package session
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 )
 
 // Copilot reads and writes the GitHub Copilot CLI JSONL event format.
 type Copilot struct{}
 
-func (Copilot) Read(r io.Reader) (Session, error) { return readCopilot(r) }
+func (Copilot) Read(r io.Reader) (Session, error) { return readCaptured(r, readCopilot) }
 
 func (Copilot) Write(w io.Writer, s Session) error { return writeCopilot(w, s) }
 
@@ -139,9 +135,13 @@ func readCopilot(r io.Reader) (Session, error) {
 			recognized = true
 			var data struct {
 				ToolCallID string `json:"toolCallId"`
+				Success    *bool  `json:"success"`
 				Result     struct {
 					Content string `json:"content"`
 				} `json:"result"`
+				Error *struct {
+					Message string `json:"message"`
+				} `json:"error"`
 			}
 			if err := json.Unmarshal(event.Data, &data); err != nil {
 				return s, fmt.Errorf("%s:%d: invalid tool.execution_complete data: %w", s.SourcePath, line, err)
@@ -151,7 +151,11 @@ func readCopilot(r io.Reader) (Session, error) {
 				// it is reported instead of being attached to a guess.
 				continue
 			}
-			result := &ToolResult{ID: data.ToolCallID, Content: data.Result.Content}
+			result := &ToolResult{ID: data.ToolCallID, Content: data.Result.Content, IsError: data.Success != nil && !*data.Success}
+			if result.Content == "" && data.Error != nil {
+				// A failed call may carry its reason only in error.message.
+				result.Content = data.Error.Message
+			}
 			s.Messages = append(s.Messages, Message{Role: "tool", Timestamp: event.Timestamp, Parts: []ContentBlock{{Type: "tool_result", ToolResult: result}}})
 		case "session.compaction_complete":
 			recognized = true
@@ -261,7 +265,10 @@ func writeCopilot(w io.Writer, s Session) error {
 				if err != nil {
 					return fmt.Errorf("message %d part %d: %w", i, j, err)
 				}
-				data := map[string]any{"toolCallId": part.ToolResult.ID, "result": map[string]any{"content": content}}
+				data := map[string]any{"toolCallId": part.ToolResult.ID, "success": !part.ToolResult.IsError, "result": map[string]any{"content": content}}
+				if part.ToolResult.IsError {
+					data["error"] = map[string]any{"message": content}
+				}
 				if err := emit("tool.execution_complete", message.Timestamp, data); err != nil {
 					return err
 				}
@@ -272,28 +279,6 @@ func writeCopilot(w io.Writer, s Session) error {
 	}
 	_, err := io.Copy(w, &buf)
 	return err
-}
-
-// parseCopilotFile reads one local Copilot CLI events.jsonl file.
-func parseCopilotFile(path string) (Session, error) {
-	data, err := os.ReadFile(path)
-	s := Session{SourceType: "copilot", SourcePath: path}
-	if err != nil {
-		return s, err
-	}
-	s, err = readCopilot(bytes.NewReader(data))
-	if err != nil {
-		s.SourcePath = path
-		return s, err
-	}
-	s.Original = data
-	s.SourcePath = path
-	if info, statErr := os.Stat(path); statErr == nil {
-		s.Updated = info.ModTime()
-	}
-	sum := sha256.Sum256([]byte("copilot\x00" + path))
-	s.ID = hex.EncodeToString(sum[:16])
-	return s, nil
 }
 
 // skippedCopilotLimitations reports the Copilot content that stays out of
@@ -320,7 +305,7 @@ func skippedCopilotLimitations(s Session) []string {
 			continue
 		}
 		switch event.Type {
-		case "user.message", "assistant.message":
+		case "user.message":
 			var data struct {
 				Content string `json:"content"`
 			}
@@ -334,7 +319,7 @@ func skippedCopilotLimitations(s Session) []string {
 			if json.Unmarshal(event.Data, &data) == nil && data.ToolCallID == "" {
 				resultsWithoutCall++
 			}
-		case "session.start", "session.info", "session.shutdown", "session.resume", "tool.execution_start", "session.compaction_complete":
+		case "session.start", "assistant.message", "session.info", "session.shutdown", "session.resume", "tool.execution_start", "session.compaction_complete":
 		default:
 			name := event.Type
 			if name == "" {
@@ -354,16 +339,7 @@ func skippedCopilotLimitations(s Session) []string {
 		limitations = append(limitations, fmt.Sprintf("Source contains %d tool result(s) with no toolCallId; they cannot pair with any call.", resultsWithoutCall))
 	}
 	if len(unknown) > 0 {
-		types := make([]string, 0, len(unknown))
-		for name := range unknown {
-			types = append(types, name)
-		}
-		sort.Strings(types)
-		parts := make([]string, 0, len(types))
-		for _, name := range types {
-			parts = append(parts, fmt.Sprintf("%s=%d", name, unknown[name]))
-		}
-		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented Copilot event types (%s); the original bytes retain them.", strings.Join(parts, ", ")))
+		limitations = append(limitations, fmt.Sprintf("Source contains unrepresented Copilot event types (%s); the original bytes retain them.", formatCounts(unknown)))
 	}
 	return limitations
 }

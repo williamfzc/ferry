@@ -496,6 +496,16 @@ func TestTraeTextSourceReasoningIsNotTranscriptText(t *testing.T) {
 	if strings.Contains(s.Messages[0].Parts[0].Text, secret) {
 		t.Fatal("source reasoning leaked into the common transcript")
 	}
+	transfer, err := Convert(s, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(transfer.Target, []byte(secret)) {
+		t.Fatal("target leaked source-reasoning text")
+	}
+	if !strings.Contains(strings.Join(transfer.Limitations, "\n"), "text(source=reasoning)") {
+		t.Fatalf("dropped reasoning text was not reported: %v", transfer.Limitations)
+	}
 }
 
 func TestTraeVisibleUserEventWithContextMarkersIsPreserved(t *testing.T) {
@@ -506,5 +516,221 @@ func TestTraeVisibleUserEventWithContextMarkersIsPreserved(t *testing.T) {
 	}
 	if len(s.Messages) != 1 || s.Messages[0].Parts[0].Text != "<environment_context>user example</environment_context>" {
 		t.Fatalf("visible user event was omitted: %+v", s.Messages)
+	}
+}
+
+func TestTraeReadDropsReasoningFromObjectContentAndToolResultText(t *testing.T) {
+	data := []byte(`{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work"}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"assistant","content":{"type":"reasoning","text":"secret"}}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"function_call","call_id":"call-1","name":"run","arguments":"{}"}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-01-01T00:00:04Z","payload":{"type":"function_call_output","call_id":"call-1","output":[{"type":"text","source":"reasoning","text":"SECRET"},{"type":"text","text":"ok"}]}}` + "\n")
+	s, err := (Trae{}).Read(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 3 {
+		t.Fatalf("reasoning-only object content was not dropped: %+v", s.Messages)
+	}
+	result := s.Messages[2].Parts[0].ToolResult
+	if result.Content != "ok" || string(result.RawContent) != `[{"type":"text","text":"ok"}]` {
+		t.Fatalf("reasoning leaked into tool result: content=%q raw=%s", result.Content, result.RawContent)
+	}
+}
+
+// Trae tool outputs carrying reasoning items must not leak them through the
+// structured RawContent that target writers serialize as JSON text, and the
+// stripped reasoning must be reported like message-content reasoning.
+func TestTraeToolOutputReasoningIsStrippedFromProjection(t *testing.T) {
+	data := []byte(`{"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work"}}
+{"type":"history_mutation","timestamp":"2026-01-01T00:00:01Z","payload":{"operation":"append","items":[{"type":"function_call","call_id":"c1","name":"run","arguments":"{}"},{"type":"function_call_output","call_id":"c1","output":[{"type":"reasoning_text","text":"SECRET-THOUGHT"},{"type":"text","text":"public output"}]}]}}
+`)
+	s, err := (Trae{}).Read(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"claude", "codex", "opencode", "pi"} {
+		transfer, err := Convert(s, target)
+		if err != nil {
+			t.Fatalf("%s: %v", target, err)
+		}
+		if strings.Contains(string(transfer.Target), "SECRET-THOUGHT") {
+			t.Fatalf("%s target leaked reasoning from the tool output", target)
+		}
+		if !strings.Contains(strings.Join(transfer.Limitations, "\n"), "message.content=reasoning_text") {
+			t.Fatalf("%s: stripped tool-output reasoning was not reported: %v", target, transfer.Limitations)
+		}
+	}
+}
+
+// Trae keeps free-text tool input unwrapped like Codex, so the wrap claim
+// must not be made for it.
+func TestFreeTextInputLimitationIsAccurateForTrae(t *testing.T) {
+	original := []byte(`{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"550e8400-e29b-41d4-a716-446655440000","cwd":"/work"}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"custom_tool_call","call_id":"call-1","name":"patch","input":"apply to file x"}}
+`)
+	s, err := (Codex{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "trae")
+	if err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if strings.Contains(joined, "wrapped in an object argument for trae") {
+		t.Fatalf("trae was described as wrapping free-text input: %v", transfer.Limitations)
+	}
+	if !strings.Contains(string(transfer.Target), `"input":"apply to file x"`) {
+		t.Fatalf("trae target rewrote the free-text input: %s", transfer.Target)
+	}
+}
+
+// Trae drops user records that consist only of injected context envelopes and
+// re-creates that context natively, so the writer skips them and reports.
+func TestTraeEnvelopeContextIsSkippedAndReported(t *testing.T) {
+	original := []byte(`{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"550e8400-e29b-41d4-a716-446655440000","cwd":"/work"}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:01Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<INSTRUCTIONS>AGENTS.md contents</INSTRUCTIONS>"}]}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:02Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real question"}]}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:03Z","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]}}
+`)
+	s, err := (Codex{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "trae")
+	if err != nil {
+		t.Fatalf("envelope context made the conversion fail: %v", err)
+	}
+	if strings.Contains(string(transfer.Target), "AGENTS.md contents") {
+		t.Fatal("envelope context was written although Trae drops it on read-back")
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if !strings.Contains(joined, "injected context envelope text part(s)") {
+		t.Fatalf("envelope removal was not reported: %v", transfer.Limitations)
+	}
+	target, err := (Trae{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(target.Messages) != 2 || target.Messages[0].Parts[0].Text != "real question" {
+		t.Fatalf("real dialogue was lost: %+v", target.Messages)
+	}
+}
+
+// Trae collapses identical tool-call replays on read-back, so the writer must
+// refuse them up front with a clear reason.
+func TestTraeRejectsIdenticalToolCallReplays(t *testing.T) {
+	call := func() ContentBlock {
+		return ContentBlock{Type: "tool_call", ToolCall: &ToolCall{ID: "dup", Name: "run", Input: json.RawMessage(`{}`)}}
+	}
+	s := Session{NativeID: "123e4567-e89b-12d3-a456-426614174000", Workspace: "/work", Messages: []Message{{
+		Role:      "assistant",
+		Timestamp: "2026-01-01T00:00:00Z",
+		Parts:     []ContentBlock{call(), call()},
+	}}}
+	err := (Trae{}).Write(&bytes.Buffer{}, s)
+	if err == nil || !strings.Contains(err.Error(), "identical replays") {
+		t.Fatalf("expected a clear duplicate-replay error, got %v", err)
+	}
+}
+
+// Trae collapses identical tool-result replays too, so the writer refuses
+// them up front with the same clear reason as duplicate calls.
+func TestTraeRejectsIdenticalToolResultReplays(t *testing.T) {
+	result := func() ContentBlock {
+		return ContentBlock{Type: "tool_result", ToolResult: &ToolResult{ID: "dup", Content: "same"}}
+	}
+	s := Session{NativeID: "123e4567-e89b-12d3-a456-426614174000", Workspace: "/work", Messages: []Message{{
+		Role:      "tool",
+		Timestamp: "2026-01-01T00:00:00Z",
+		Parts:     []ContentBlock{result(), result()},
+	}}}
+	err := (Trae{}).Write(&bytes.Buffer{}, s)
+	if err == nil || !strings.Contains(err.Error(), `tool result "dup"`) {
+		t.Fatalf("expected a clear duplicate-result error, got %v", err)
+	}
+}
+
+func TestTraeWriteReadPreservesToolResultError(t *testing.T) {
+	source := Session{
+		NativeID:  "123e4567-e89b-12d3-a456-426614174000",
+		Workspace: "/work",
+		Messages: []Message{{
+			Role:      "tool",
+			Timestamp: "2026-01-01T00:00:00Z",
+			Parts: []ContentBlock{{Type: "tool_result", ToolResult: &ToolResult{
+				ID: "call-1", Content: "failed", IsError: true,
+			}}},
+		}},
+	}
+
+	var output bytes.Buffer
+	if err := (Trae{}).Write(&output, source); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), `"is_error":true`) {
+		t.Fatalf("Trae output dropped the tool error flag: %s", output.String())
+	}
+
+	got, err := (Trae{}).Read(bytes.NewReader(output.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := got.Messages[0].Parts[0].ToolResult
+	if result == nil || !result.IsError {
+		t.Fatalf("Trae read-back dropped the tool error flag: %+v", got.Messages)
+	}
+}
+
+func TestConvertToTraePreservesToolResultError(t *testing.T) {
+	original := []byte(`{"type":"user","sessionId":"123e4567-e89b-12d3-a456-426614174000","cwd":"/work","timestamp":"2026-01-01T00:00:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"failed","is_error":true}]}}` + "\n")
+	source, err := (Claude{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	transfer, err := Convert(source, "trae")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(transfer.Limitations, "\n"), "flag is dropped") {
+		t.Fatalf("preserved error incorrectly reported lost: %v", transfer.Limitations)
+	}
+	if !strings.Contains(string(transfer.Target), `"is_error":true`) {
+		t.Fatalf("Trae conversion dropped the tool error flag: %s", transfer.Target)
+	}
+	got, err := (Trae{}).Read(bytes.NewReader(transfer.Target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := got.Messages[0].Parts[0].ToolResult
+	if result == nil || !result.IsError {
+		t.Fatalf("Trae conversion read-back dropped the tool error flag: %+v", got.Messages)
+	}
+}
+
+func TestConvertTraeReportsUnsupportedCompletedItemTypes(t *testing.T) {
+	original := []byte(`{"type":"session_meta","payload":{"id":"123e4567-e89b-12d3-a456-426614174022","cwd":"/work/trae"}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"command-1","command":"ls","status":"completed"}}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning","id":"reasoning-1","content":[{"type":"reasoning","text":"private"}]}}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"answer-1","content":[{"type":"Text","text":"kept"}]}}}
+`)
+	source, err := (Trae{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(source, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(transfer.Original, original) {
+		t.Fatal("Trae conversion changed the source snapshot")
+	}
+	limitations := strings.Join(transfer.Limitations, "\n")
+	for _, itemType := range []string{"CommandExecution", "Reasoning"} {
+		if !strings.Contains(limitations, "event_msg.item_completed.item="+itemType+"=1") {
+			t.Fatalf("unsupported completed item type %q was not reported: %v", itemType, transfer.Limitations)
+		}
 	}
 }

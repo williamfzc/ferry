@@ -4,6 +4,8 @@ package session
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -358,5 +360,295 @@ func TestOpenCodeWriteReportsShortWrite(t *testing.T) {
 	s := readOpenCodeFixture(t)
 	if err := (OpenCode{}).Write(traeShortWriter{}, s); err != io.ErrShortWrite {
 		t.Fatalf("short writer error = %v, want %v", err, io.ErrShortWrite)
+	}
+}
+
+func TestOpenCodeNullToolResultIsRetained(t *testing.T) {
+	result, ok := openCodeToolResult("call-null", openCodeToolState{
+		Status: "completed", Output: []byte("null"),
+	})
+	if !ok || result == nil || result.Content != "null" || string(result.RawContent) != "null" {
+		t.Fatalf("OpenCode dropped explicit null output: ok=%v result=%+v", ok, result)
+	}
+}
+
+func openCodeToolStateDocument(state string) []byte {
+	return []byte(fmt.Sprintf(`{"info":{"id":"ses_state","directory":"/work"},"messages":[{"info":{"id":"msg_state","sessionID":"ses_state","role":"assistant","time":{"created":1}},"parts":[{"type":"tool","callID":"call_state","tool":"read"%s}]}]}`, state))
+}
+
+func TestOpenCodeReadRejectsMissingOrMalformedToolState(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state string
+		want  string
+	}{
+		{name: "missing", state: ``, want: "missing state"},
+		{name: "null", state: `,"state":null`, want: "missing state"},
+		{name: "scalar", state: `,"state":"running"`, want: "expected an object"},
+		{name: "missing status", state: `,"state":{"input":{}}`, want: "status is required"},
+		{name: "invalid status", state: `,"state":{"status":true,"input":{}}`, want: "status must be a non-empty string"},
+		{name: "missing input", state: `,"state":{"status":"running"}`, want: "input is required"},
+		{name: "null input", state: `,"state":{"status":"running","input":null}`, want: "input is required"},
+		{name: "completed without output", state: `,"state":{"status":"completed","input":{}}`, want: "output is required"},
+		{name: "error without error", state: `,"state":{"status":"error","input":{}}`, want: "error is required"},
+		{name: "error has wrong type", state: `,"state":{"status":"error","input":{},"error":true}`, want: "cannot unmarshal bool into Go struct field"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := (OpenCode{}).Read(bytes.NewReader(openCodeToolStateDocument(tc.state)))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Read error = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestOpenCodeReadAcceptsStructuredUnknownToolState(t *testing.T) {
+	data := openCodeToolStateDocument(`,"state":{"status":"cancelled","input":"legacy JSON arguments"}`)
+	s, err := (OpenCode{}).Read(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 1 || len(s.Messages[0].Parts) != 1 || s.Messages[0].Parts[0].ToolCall == nil {
+		t.Fatalf("unexpected messages for unknown state: %+v", s.Messages)
+	}
+	if got := s.Messages[0].Parts[0].ToolCall.Status; got != "" {
+		t.Fatalf("unknown OpenCode status was inferred as %q", got)
+	}
+}
+
+func openCodeToolStatusDocument(status string) []byte {
+	return []byte(fmt.Sprintf(`{"info":{"id":"ses_status","directory":"/work"},"messages":[{"info":{"id":"msg_status","sessionID":"ses_status","role":"assistant","time":{"created":1}},"parts":[{"type":"tool","callID":"call_status","tool":"read","state":{"status":%q,"input":{"path":"file"},"output":"done","error":"failed","time":{"start":1,"end":2}}}]}]}`, status))
+}
+
+func TestOpenCodeReadMapsToolStatusesToACP(t *testing.T) {
+	for _, tc := range []struct {
+		openCode string
+		acp      string
+	}{
+		{openCode: "pending", acp: "pending"},
+		{openCode: "running", acp: "in_progress"},
+		{openCode: "completed", acp: "completed"},
+		{openCode: "error", acp: "failed"},
+	} {
+		t.Run(tc.openCode, func(t *testing.T) {
+			s, err := (OpenCode{}).Read(bytes.NewReader(openCodeToolStatusDocument(tc.openCode)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(s.Messages) == 0 || len(s.Messages[0].Parts) == 0 || s.Messages[0].Parts[0].ToolCall == nil {
+				t.Fatalf("tool call was not read: %+v", s.Messages)
+			}
+			if got := s.Messages[0].Parts[0].ToolCall.Status; got != tc.acp {
+				t.Fatalf("OpenCode %q status = %q, want %q", tc.openCode, got, tc.acp)
+			}
+		})
+	}
+}
+
+func TestOpenCodeReadDoesNotInferUnknownToolStatus(t *testing.T) {
+	s, err := (OpenCode{}).Read(bytes.NewReader(openCodeToolStatusDocument("cancelled")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Messages) != 1 || len(s.Messages[0].Parts) != 1 || s.Messages[0].Parts[0].ToolCall == nil {
+		t.Fatalf("unexpected messages for unknown status: %+v", s.Messages)
+	}
+	part := s.Messages[0].Parts[0]
+	if got := part.ToolCall.Status; got != "" {
+		t.Fatalf("unknown OpenCode status was inferred as %q", got)
+	}
+	if !strings.Contains(string(part.Raw), `"status":"cancelled"`) {
+		t.Fatalf("unknown OpenCode status was not preserved in raw part: %s", part.Raw)
+	}
+}
+
+func TestConvertReportsUnknownOpenCodeToolStatus(t *testing.T) {
+	source, err := (OpenCode{}).Read(bytes.NewReader(openCodeToolStatusDocument("cancelled")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(source, "claude")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(transfer.Limitations, "\n"), `Tool call status "cancelled" on 1 call(s) has no ACP equivalent`) {
+		t.Fatalf("unknown OpenCode status loss was not reported: %v", transfer.Limitations)
+	}
+}
+
+// OpenCode tool names carry the qualified identity so MCP calls stay
+// attributable; duplicate call ids are rejected instead of collapsed.
+func TestOpenCodeQualifiedNamesAndDuplicateCalls(t *testing.T) {
+	source := []byte(codexTestMeta +
+		`{"type":"response_item","timestamp":"2026-10-27T00:00:01Z","payload":{"type":"function_call","call_id":"c1","namespace":"mcp__srv","name":"js","arguments":"{}"}}` + "\n" +
+		`{"type":"response_item","timestamp":"2026-10-27T00:00:02Z","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}` + "\n")
+	s, err := (Codex{}).Read(bytes.NewReader(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(transfer.Target), `"tool": "mcp__srv__js"`) {
+		t.Fatalf("qualified tool name missing:\n%s", transfer.Target)
+	}
+
+	duplicate := Session{NativeID: "ses_dup00000000000000000000", Workspace: "/example", Messages: []Message{
+		{Role: "user", Timestamp: "2026-01-01T00:00:00Z", Parts: []ContentBlock{{Type: "text", Text: "x"}}},
+		{Role: "assistant", Timestamp: "2026-01-01T00:00:01Z", Parts: []ContentBlock{
+			{Type: "tool_call", ToolCall: &ToolCall{ID: "dup", Name: "a", Input: json.RawMessage(`{}`)}},
+			{Type: "tool_call", ToolCall: &ToolCall{ID: "dup", Name: "b", Input: json.RawMessage(`{}`)}},
+		}},
+	}}
+	var out bytes.Buffer
+	if err := (OpenCode{}).Write(&out, duplicate); err == nil || !strings.Contains(err.Error(), "duplicate tool call id") {
+		t.Fatalf("duplicate call ids not rejected: %v", err)
+	}
+}
+
+// Storage sessions reject misplaced files, duplicate ids, foreign messages,
+// and archives that attach parts to the wrong message.
+func TestOpenCodeStorageGuards(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "ses_guard0000000000000000000"
+	wrong := filepath.Join(root, "elsewhere", sessionID+".json")
+	if err := os.MkdirAll(filepath.Dir(wrong), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wrong, []byte(`{"id":"`+sessionID+`","directory":"/x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse(wrong, "opencode"); err == nil || !strings.Contains(err.Error(), "not inside an OpenCode storage tree") {
+		t.Fatalf("misplaced session accepted: %v", err)
+	}
+
+	sessionFile := writeOpenCodeStorage(t, root)
+	s, err := Parse(sessionFile, "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Reorder the archive so the part follows another message.
+	lines := bytes.Split(bytes.TrimSpace(s.Original), []byte("\n"))
+	if len(lines) != 4 {
+		t.Fatalf("unexpected archive shape: %d lines", len(lines))
+	}
+	reordered := append([]byte{}, lines[0]...)
+	reordered = append(reordered, '\n')
+	reordered = append(reordered, lines[2]...) // assistant message
+	reordered = append(reordered, '\n')
+	reordered = append(reordered, lines[1]...) // user message before its part
+	reordered = append(reordered, '\n')
+	reordered = append(reordered, lines[3]...) // part of the assistant message
+	reordered = append(reordered, '\n')
+	if _, err := (OpenCode{}).Read(bytes.NewReader(reordered)); err == nil || !strings.Contains(err.Error(), "does not belong to message") {
+		t.Fatalf("misattributed part accepted: %v", err)
+	}
+}
+
+// OpenCode stores millisecond timestamps; sub-millisecond precision is
+// truncated and reported instead of failing the conversion.
+func TestOpenCodeSubMillisecondTimestampIsTruncatedAndReported(t *testing.T) {
+	original := []byte(`{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{"id":"550e8400-e29b-41d4-a716-446655440000","cwd":"/work"}}
+{"type":"response_item","timestamp":"2026-01-01T00:00:01.000500000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}
+`)
+	s, err := (Codex{}).Read(bytes.NewReader(original))
+	if err != nil {
+		t.Fatal(err)
+	}
+	transfer, err := Convert(s, "opencode")
+	if err != nil {
+		t.Fatalf("sub-millisecond timestamp failed the conversion: %v", err)
+	}
+	joined := strings.Join(transfer.Limitations, "\n")
+	if !strings.Contains(joined, "millisecond precision") {
+		t.Fatalf("timestamp truncation was not reported: %v", transfer.Limitations)
+	}
+}
+
+// An OpenCode tool part couples a call and its result, so content between
+// them cannot keep its order and must be rejected rather than reordered.
+func TestOpenCodeRejectsSeparatedToolResult(t *testing.T) {
+	s := Session{
+		NativeID: "ses_sep00000000000000000000", Workspace: "/example",
+		Messages: []Message{
+			{Role: "user", Timestamp: "2026-01-01T00:00:00Z", Parts: []ContentBlock{{Type: "text", Text: "run"}}},
+			{Role: "assistant", Timestamp: "2026-01-01T00:00:01Z", Parts: []ContentBlock{
+				{Type: "tool_call", ToolCall: &ToolCall{ID: "c1", Name: "bash", Input: json.RawMessage(`{}`)}},
+				{Type: "text", Text: "noted"},
+			}},
+			{Role: "tool", Timestamp: "2026-01-01T00:00:02Z", Parts: []ContentBlock{
+				{Type: "tool_result", ToolResult: &ToolResult{ID: "c1", Content: "ok"}},
+			}},
+		},
+	}
+	var out bytes.Buffer
+	if err := (OpenCode{}).Write(&out, s); err == nil || !strings.Contains(err.Error(), "separated from its call") {
+		t.Fatalf("expected separation rejection, got %v", err)
+	}
+	if out.Len() != 0 {
+		t.Fatal("rejection must not emit output")
+	}
+}
+
+// Files that are not valid JSON (for example with stray non-UTF-8 bytes)
+// must still be archived byte-for-byte when they belong to a session.
+func TestOpenCodeArchiveKeepsInvalidBytes(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "ses_bytes00000000000000000000"
+	projectDir := filepath.Join(root, "storage", "session", "proj")
+	messageDir := filepath.Join(root, "storage", "message", sessionID)
+	partDir := filepath.Join(root, "storage", "part", "msg_bytes0000000000000000b")
+	for _, dir := range []string{projectDir, messageDir, partDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := map[string][]byte{
+		filepath.Join(projectDir, sessionID+".json"):                 []byte(`{"id":"` + sessionID + `","directory":"/example","time":{"created":1770000000000,"updated":1770000006000}}`),
+		filepath.Join(messageDir, "msg_bytes0000000000000000b.json"): []byte(`{"id":"msg_bytes0000000000000000b","sessionID":"` + sessionID + `","role":"assistant","time":{"created":1770000001000}}`),
+		filepath.Join(partDir, "prt_bytes0000000000000001.json"):     append([]byte(`{"id":"prt_bytes0000000000000001","type":"text","text":"ok`), 0xff, '}'),
+	}
+	for path, content := range files {
+		if err := os.WriteFile(path, content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s, err := Parse(filepath.Join(projectDir, sessionID+".json"), "opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents, err := openCodeReadArchive(s.Original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, msg := range contents.Messages {
+		for _, raw := range msg.Parts {
+			if bytes.IndexByte(raw, 0xff) >= 0 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Fatal("invalid byte lost from the archive")
+	}
+	var restored bytes.Buffer
+	if err := s.RestoreOriginal(&restored); err != nil || !bytes.Equal(restored.Bytes(), s.Original) {
+		t.Fatal("archive restore changed bytes")
+	}
+}
+
+// Discovery only treats ses_*.json files as OpenCode sessions.
+func TestDiscoverOpenCodeIgnoresStrayFiles(t *testing.T) {
+	home := t.TempDir()
+	sessionFile := writeOpenCodeStorage(t, filepath.Join(home, ".local", "share", "opencode"))
+	stray := filepath.Join(filepath.Dir(sessionFile), "notes.json")
+	if err := os.WriteFile(stray, []byte(`{"not":"a session"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sessions, errs := Discover(home)
+	if len(errs) != 0 || len(sessions) != 1 {
+		t.Fatalf("got %d sessions, %d errors", len(sessions), len(errs))
 	}
 }
