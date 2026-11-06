@@ -143,6 +143,13 @@ sh scripts/native-pi-smoke-test.sh
 sh scripts/native-trae-smoke-test.sh
 ```
 
+The one exception is [`scripts/native-trae-resume-check.sh`](scripts/native-trae-resume-check.sh), which proves a full resume round trip: it converts a Codex session with Ferry, registers the generated rollout in an isolated Trae store, and asks the installed TRAE CLI to resume it with a tiny prompt (the model actually answers). It starts one real model turn, so it costs tokens on the logged-in account and requires a trae-cli login:
+
+```bash
+sh scripts/native-trae-resume-check.sh                 # synthetic Codex session
+sh scripts/native-trae-resume-check.sh ~/.codex/sessions/2026/10/27/rollout-<id>.jsonl
+```
+
 CI runs the format, vet, and race tests on every push and pull request, and uploads the coverage profile to Codecov.
 
 ## Contributing
